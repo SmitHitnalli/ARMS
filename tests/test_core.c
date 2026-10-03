@@ -15,6 +15,7 @@
 #include "operations.h"
 #include "history.h"
 #include "reports.h"
+#include "graph.h"
 
 /* Test-only hook defined in history.c when built with -DARMS_TESTING. */
 extern int history_fail_next_alloc;
@@ -2076,6 +2077,204 @@ static void test_reports_searches(void)
     history_clear(&h);
 }
 
+/* Test graph: A-B, A-C, B-D, C-D, D-E, and F isolated. Indexes A=0 .. F=5. */
+static void make_test_graph(AirportGraph *g)
+{
+    const char *ids[] = { "A", "B", "C", "D", "E", "F" };
+    graph_init(g);
+    for (int i = 0; i < 6; i++) {
+        assert(graph_add_node(g, ids[i], NULL) == ARMS_OK);
+    }
+    assert(graph_add_edge(g, "A", "B") == ARMS_OK);
+    assert(graph_add_edge(g, "A", "C") == ARMS_OK);
+    assert(graph_add_edge(g, "B", "D") == ARMS_OK);
+    assert(graph_add_edge(g, "C", "D") == ARMS_OK);
+    assert(graph_add_edge(g, "D", "E") == ARMS_OK);
+}
+
+static void test_graph_empty_and_single(void)
+{
+    AirportGraph g;
+    int order[MAX_NODES], n = -1, r = -1;
+    graph_init(&g);
+    assert(graph_node_count(&g) == 0);
+    assert(graph_find_node(&g, "A") == -1);
+    assert(graph_node_at(&g, 0) == NULL);
+    assert(graph_bfs(&g, "A", order, MAX_NODES, &n) == ARMS_ERR_NOT_FOUND && n == 0);
+    assert(graph_is_reachable(&g, "A", "A", &r) == ARMS_ERR_NOT_FOUND && r == 0);
+
+    assert(graph_add_node(&g, "RWY-09", "Runway 09 entry") == ARMS_OK);
+    assert(graph_node_count(&g) == 1);
+    assert(graph_find_node(&g, "RWY-09") == 0);
+    assert(strcmp(graph_node_at(&g, 0)->id, "RWY-09") == 0);
+    assert(strcmp(graph_node_at(&g, 0)->label, "Runway 09 entry") == 0);
+    assert(graph_node_at(&g, 1) == NULL && graph_node_at(&g, -1) == NULL);
+    assert(graph_bfs(&g, "RWY-09", order, MAX_NODES, &n) == ARMS_OK && n == 1 && order[0] == 0);
+    assert(graph_dfs(&g, "RWY-09", order, MAX_NODES, &n) == ARMS_OK && n == 1 && order[0] == 0);
+    assert(graph_is_reachable(&g, "RWY-09", "RWY-09", &r) == ARMS_OK && r == 1);
+}
+
+static void test_graph_node_rules(void)
+{
+    AirportGraph g;
+    graph_init(&g);
+    assert(graph_add_node(&g, "A", NULL) == ARMS_OK);
+    assert(strcmp(graph_node_at(&g, 0)->label, "") == 0);          /* NULL label -> "" */
+    assert(graph_add_node(&g, "A", "again") == ARMS_ERR_DUPLICATE);
+    assert(graph_add_node(&g, "bad id", NULL) == ARMS_ERR_INVALID_ID);
+    assert(graph_add_node(&g, "", NULL) == ARMS_ERR_INVALID_ID);
+    assert(graph_add_node(&g, NULL, NULL) == ARMS_ERR_INVALID_ARG);
+    assert(graph_add_node(NULL, "B", NULL) == ARMS_ERR_INVALID_ARG);
+    assert(graph_node_count(&g) == 1);
+}
+
+static void test_graph_edge_rules(void)
+{
+    AirportGraph g;
+    graph_init(&g);
+    assert(graph_add_node(&g, "A", NULL) == ARMS_OK);
+    assert(graph_add_node(&g, "B", NULL) == ARMS_OK);
+    assert(!graph_adjacent(&g, "A", "B"));
+    assert(graph_add_edge(&g, "A", "B") == ARMS_OK);
+    assert(graph_adjacent(&g, "A", "B") && graph_adjacent(&g, "B", "A"));   /* symmetric */
+    assert(graph_add_edge(&g, "A", "B") == ARMS_ERR_DUPLICATE);
+    assert(graph_add_edge(&g, "B", "A") == ARMS_ERR_DUPLICATE);             /* reverse too */
+    assert(graph_add_edge(&g, "A", "A") == ARMS_ERR_INVALID_ARG);           /* self-edge */
+    assert(!graph_adjacent(&g, "A", "A"));
+    assert(graph_add_edge(&g, "A", "Z") == ARMS_ERR_NOT_FOUND);
+    assert(graph_add_edge(&g, "Z", "A") == ARMS_ERR_NOT_FOUND);
+    assert(graph_add_edge(&g, "Z", "Z") == ARMS_ERR_NOT_FOUND);
+    assert(graph_add_edge(&g, NULL, "A") == ARMS_ERR_INVALID_ARG);
+    assert(!graph_adjacent(&g, "A", "Z"));
+}
+
+static void test_graph_bfs_dfs_order(void)
+{
+    AirportGraph g;
+    int order[MAX_NODES], n = -1;
+    make_test_graph(&g);
+
+    const int bfs_expected[] = { 0, 1, 2, 3, 4 };          /* A B C D E */
+    assert(graph_bfs(&g, "A", order, MAX_NODES, &n) == ARMS_OK);
+    assert(n == 5 && memcmp(order, bfs_expected, sizeof bfs_expected) == 0);
+
+    const int dfs_expected[] = { 0, 1, 3, 2, 4 };          /* A B D C E */
+    assert(graph_dfs(&g, "A", order, MAX_NODES, &n) == ARMS_OK);
+    assert(n == 5 && memcmp(order, dfs_expected, sizeof dfs_expected) == 0);
+
+    const int bfs_from_e[] = { 4, 3, 1, 2, 0 };            /* E D B C A */
+    assert(graph_bfs(&g, "E", order, MAX_NODES, &n) == ARMS_OK);
+    assert(n == 5 && memcmp(order, bfs_from_e, sizeof bfs_from_e) == 0);
+}
+
+static void test_graph_disconnected_and_reachability(void)
+{
+    AirportGraph g;
+    int order[MAX_NODES], n = -1, r = -1;
+    make_test_graph(&g);
+
+    assert(graph_bfs(&g, "F", order, MAX_NODES, &n) == ARMS_OK && n == 1 && order[0] == 5);
+    assert(graph_dfs(&g, "A", order, MAX_NODES, &n) == ARMS_OK && n == 5);   /* F not reached */
+    for (int i = 0; i < n; i++) {
+        assert(order[i] != 5);
+    }
+
+    assert(graph_is_reachable(&g, "A", "E", &r) == ARMS_OK && r == 1);
+    assert(graph_is_reachable(&g, "E", "A", &r) == ARMS_OK && r == 1);
+    assert(graph_is_reachable(&g, "A", "F", &r) == ARMS_OK && r == 0);
+    assert(graph_is_reachable(&g, "F", "A", &r) == ARMS_OK && r == 0);
+    assert(graph_is_reachable(&g, "F", "F", &r) == ARMS_OK && r == 1);       /* start == target */
+    assert(graph_is_reachable(&g, "A", "Z", &r) == ARMS_ERR_NOT_FOUND && r == 0);
+    assert(graph_is_reachable(&g, "Z", "A", &r) == ARMS_ERR_NOT_FOUND && r == 0);
+    assert(graph_is_reachable(&g, "Z", "Z", &r) == ARMS_ERR_NOT_FOUND && r == 0);
+    assert(graph_is_reachable(&g, "A", "B", NULL) == ARMS_ERR_INVALID_ARG);
+}
+
+static void test_graph_traversal_errors(void)
+{
+    AirportGraph g;
+    int order[MAX_NODES], n = -1;
+    make_test_graph(&g);
+
+    /* unknown start */
+    for (int i = 0; i < MAX_NODES; i++) order[i] = -99;
+    assert(graph_bfs(&g, "Z", order, MAX_NODES, &n) == ARMS_ERR_NOT_FOUND && n == 0);
+    assert(order[0] == -99);
+    n = -1;
+    assert(graph_dfs(&g, "Z", order, MAX_NODES, &n) == ARMS_ERR_NOT_FOUND && n == 0);
+    assert(order[0] == -99);
+
+    /* output too small: the A..E component has 5 nodes */
+    n = -1;
+    assert(graph_bfs(&g, "A", order, 4, &n) == ARMS_ERR_FULL && n == 0);
+    assert(order[0] == -99 && order[3] == -99);
+    n = -1;
+    assert(graph_dfs(&g, "A", order, 4, &n) == ARMS_ERR_FULL && n == 0);
+    assert(order[0] == -99 && order[3] == -99);
+    assert(graph_bfs(&g, "A", order, 5, &n) == ARMS_OK && n == 5);           /* exact fit */
+    assert(graph_bfs(&g, "F", order, 0, &n) == ARMS_ERR_FULL && n == 0);     /* cap 0 */
+
+    /* bad arguments */
+    assert(graph_bfs(NULL, "A", order, MAX_NODES, &n) == ARMS_ERR_INVALID_ARG);
+    assert(graph_bfs(&g, NULL, order, MAX_NODES, &n) == ARMS_ERR_INVALID_ARG);
+    assert(graph_dfs(&g, "A", NULL, MAX_NODES, &n) == ARMS_ERR_INVALID_ARG);
+    assert(graph_dfs(&g, "A", order, -1, &n) == ARMS_ERR_INVALID_ARG);
+    assert(graph_dfs(&g, "A", order, MAX_NODES, NULL) == ARMS_ERR_INVALID_ARG);
+}
+
+static void test_graph_full(void)
+{
+    AirportGraph g;
+    char id[8];
+    graph_init(&g);
+    for (int i = 0; i < MAX_NODES; i++) {
+        snprintf(id, sizeof id, "N%d", i);
+        assert(graph_add_node(&g, id, NULL) == ARMS_OK);
+    }
+    assert(graph_node_count(&g) == MAX_NODES);
+    assert(graph_add_node(&g, "EXTRA", NULL) == ARMS_ERR_FULL);
+    assert(graph_node_count(&g) == MAX_NODES);
+    assert(graph_add_node(&g, "N0", NULL) == ARMS_ERR_DUPLICATE);            /* dup beats full */
+
+    /* chain all nodes, then traverse the full-size graph */
+    int order[MAX_NODES], n = 0;
+    for (int i = 0; i + 1 < MAX_NODES; i++) {
+        char a[16], b[16];
+        snprintf(a, sizeof a, "N%d", i);
+        snprintf(b, sizeof b, "N%d", i + 1);
+        assert(graph_add_edge(&g, a, b) == ARMS_OK);
+    }
+    assert(graph_dfs(&g, "N0", order, MAX_NODES, &n) == ARMS_OK && n == MAX_NODES);
+    for (int i = 0; i < MAX_NODES; i++) {
+        assert(order[i] == i);
+    }
+    assert(graph_bfs(&g, "N15", order, MAX_NODES, &n) == ARMS_OK && n == MAX_NODES);
+    assert(order[0] == 15 && order[MAX_NODES - 1] == 0);
+}
+
+static void test_graph_long_label_truncated(void)
+{
+    AirportGraph g;
+    graph_init(&g);
+    assert(graph_add_node(&g, "A", "0123456789012345678901234567890123456789") == ARMS_OK);
+    assert(strlen(graph_node_at(&g, 0)->label) == NODE_LABEL_LEN - 1);
+}
+
+static void test_graph_unchanged_by_traversal(void)
+{
+    AirportGraph g, before;
+    int order[MAX_NODES], n, r;
+    make_test_graph(&g);
+    memcpy(&before, &g, sizeof g);
+
+    assert(graph_bfs(&g, "A", order, MAX_NODES, &n) == ARMS_OK);
+    assert(graph_dfs(&g, "A", order, MAX_NODES, &n) == ARMS_OK);
+    assert(graph_is_reachable(&g, "A", "F", &r) == ARMS_OK);
+    assert(graph_bfs(&g, "A", order, 2, &n) == ARMS_ERR_FULL);
+    assert(graph_dfs(&g, "Z", order, MAX_NODES, &n) == ARMS_ERR_NOT_FOUND);
+    assert(memcmp(&before, &g, sizeof g) == 0);
+}
+
 int main(void)
 {
     test_ids_and_common();
@@ -2126,6 +2325,15 @@ int main(void)
     test_reports_flight_errors_and_capacity();
     test_reports_history();
     test_reports_searches();
+    test_graph_empty_and_single();
+    test_graph_node_rules();
+    test_graph_edge_rules();
+    test_graph_bfs_dfs_order();
+    test_graph_disconnected_and_reachability();
+    test_graph_traversal_errors();
+    test_graph_full();
+    test_graph_long_label_truncated();
+    test_graph_unchanged_by_traversal();
 
     printf("All core tests passed.\n");
     return 0;
