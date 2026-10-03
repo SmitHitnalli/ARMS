@@ -32,6 +32,7 @@ const char *arms_status_str(ArmsStatus s)
     case ARMS_ERR_INCOMPATIBLE:      return "Runway cannot handle this aircraft category";
     case ARMS_ERR_EMPTY:             return "Queue is empty";
     case ARMS_ERR_NO_RUNWAY:         return "No available compatible runway";
+    case ARMS_ERR_NO_MEMORY:         return "Out of memory";
     }
     return "Unknown status";
 }

@@ -13,6 +13,10 @@
 #include "heap.h"
 #include "scheduler.h"
 #include "operations.h"
+#include "history.h"
+
+/* Test-only hook defined in history.c when built with -DARMS_TESTING. */
+extern int history_fail_next_alloc;
 
 /* Independent copy of the approved transition table, to check flight.c against. */
 static const int expected[STATE_COUNT][STATE_COUNT] = {
@@ -1287,10 +1291,12 @@ typedef struct {
     RequestQueues rq;
     HoldingQueue  hq;
     Scheduler     s;
+    MovementHistory hist;
 } Sys;
 
 static void sys_init(Sys *y)
 {
+    history_init(&y->hist);
     flight_store_init(&y->fs);
     runway_store_init(&y->rs);
     request_init(&y->rq);
@@ -1459,7 +1465,7 @@ static void test_ops_start_complete(void)
     assert(sys_schedule(&y, fid, rid) == ARMS_OK && strcmp(fid, "F1") == 0);
 
     /* Wrong states and unknown flights. */
-    assert(ops_complete(&y.fs, &y.rs, "F1") == ARMS_ERR_INVALID_TRANSITION);
+    assert(ops_complete(&y.fs, &y.rs, &y.hist, "F1") == ARMS_ERR_INVALID_TRANSITION);
     assert(ops_start(&y.fs, &y.rs, "F2") == ARMS_ERR_INVALID_TRANSITION);
     assert(ops_start(&y.fs, &y.rs, "NOPE") == ARMS_ERR_NOT_FOUND);
     assert(ops_start(&y.fs, &y.rs, NULL) == ARMS_ERR_INVALID_ARG);
@@ -1474,16 +1480,17 @@ static void test_ops_start_complete(void)
     /* R1 is still busy, so F2 cannot be scheduled yet. */
     assert(sys_schedule(&y, fid, rid) == ARMS_ERR_NO_RUNWAY);
 
-    assert(ops_complete(&y.fs, &y.rs, "F1") == ARMS_OK);
+    assert(ops_complete(&y.fs, &y.rs, &y.hist, "F1") == ARMS_OK);
     assert(flight_find(&y.fs, "F1")->state == STATE_COMPLETED);
     assert(flight_find(&y.fs, "F1")->runway_id[0] == '\0');
     Runway *r = runway_find(&y.rs, "R1");
     assert(r->status == RUNWAY_AVAILABLE && r->current_flight_id[0] == '\0');
-    assert(ops_complete(&y.fs, &y.rs, "F1") == ARMS_ERR_INVALID_TRANSITION);
+    assert(ops_complete(&y.fs, &y.rs, &y.hist, "F1") == ARMS_ERR_INVALID_TRANSITION);
     assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
 
     /* The released runway is reusable. */
     assert(sys_schedule(&y, fid, rid) == ARMS_OK && strcmp(fid, "F2") == 0);
+    history_clear(&y.hist);
 }
 
 static void test_ops_cancel(void)
@@ -1538,7 +1545,7 @@ static void test_ops_cancel(void)
     snap_take(&y, &before);
     assert(sys_cancel(&y, "OP") == ARMS_ERR_INVALID_TRANSITION);
     assert(snap_same(&y, &before));
-    assert(ops_complete(&y.fs, &y.rs, "OP") == ARMS_OK);
+    assert(ops_complete(&y.fs, &y.rs, &y.hist, "OP") == ARMS_OK);
 
     /* Terminal states, unknown flight, bad arguments. */
     assert(sys_cancel(&y, "OP") == ARMS_ERR_INVALID_TRANSITION);
@@ -1546,6 +1553,7 @@ static void test_ops_cancel(void)
     assert(sys_cancel(&y, "NOPE") == ARMS_ERR_NOT_FOUND);
     assert(sys_cancel(&y, NULL) == ARMS_ERR_INVALID_ARG);
     assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+    history_clear(&y.hist);
 }
 
 static void test_ops_atomic_failures(void)
@@ -1572,9 +1580,9 @@ static void test_ops_atomic_failures(void)
     assert(ops_start(&y.fs, &y.rs, "OP") == ARMS_ERR_INVALID_TRANSITION);
     assert(ops_start(&y.fs, &y.rs, "WT") == ARMS_ERR_INVALID_TRANSITION);
     assert(ops_start(&y.fs, &y.rs, "NOPE") == ARMS_ERR_NOT_FOUND);
-    assert(ops_complete(&y.fs, &y.rs, "SC") == ARMS_ERR_INVALID_TRANSITION);
-    assert(ops_complete(&y.fs, &y.rs, "WT") == ARMS_ERR_INVALID_TRANSITION);
-    assert(ops_complete(&y.fs, &y.rs, "NOPE") == ARMS_ERR_NOT_FOUND);
+    assert(ops_complete(&y.fs, &y.rs, &y.hist, "SC") == ARMS_ERR_INVALID_TRANSITION);
+    assert(ops_complete(&y.fs, &y.rs, &y.hist, "WT") == ARMS_ERR_INVALID_TRANSITION);
+    assert(ops_complete(&y.fs, &y.rs, &y.hist, "NOPE") == ARMS_ERR_NOT_FOUND);
     assert(sys_cancel(&y, "OP") == ARMS_ERR_INVALID_TRANSITION);
     assert(sys_cancel(&y, "NOPE") == ARMS_ERR_NOT_FOUND);
     assert(snap_same(&y, &before));
@@ -1592,7 +1600,7 @@ static void test_ops_atomic_failures(void)
     Runway *r1 = runway_find(&y.rs, "R1");
     r1->current_flight_id[0] = '\0';
     snap_take(&y, &before);
-    assert(ops_complete(&y.fs, &y.rs, "OP") == ARMS_ERR_NOT_OCCUPIED);
+    assert(ops_complete(&y.fs, &y.rs, &y.hist, "OP") == ARMS_ERR_NOT_OCCUPIED);
     assert(snap_same(&y, &before));
     snprintf(r1->current_flight_id, sizeof r1->current_flight_id, "%s", "OP");
     assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
@@ -1663,6 +1671,162 @@ static void test_ops_invariant_checker(void)
     assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
 }
 
+/* ---------- Phase 7: movement history ---------- */
+
+static Movement make_movement(const char *id, const char *rwy)
+{
+    Movement m;
+    memset(&m, 0, sizeof m);
+    snprintf(m.flight_id, sizeof m.flight_id, "%s", id);
+    snprintf(m.runway_id, sizeof m.runway_id, "%s", rwy);
+    return m;
+}
+
+static void test_history_list_basic(void)
+{
+    MovementHistory h;
+    history_init(&h);
+    assert(history_count(&h) == 0 && h.head == NULL && h.tail == NULL);
+    assert(history_at(&h, 0) == NULL && history_find(&h, "A") == NULL);
+
+    /* first insertion */
+    Movement a = make_movement("A", "R1");
+    assert(history_append(&h, &a) == ARMS_OK);
+    assert(history_count(&h) == 1 && h.head == h.tail);
+    assert(strcmp(history_at(&h, 0)->flight_id, "A") == 0);
+
+    /* multiple records keep append order */
+    Movement b = make_movement("B", "R2"), c = make_movement("C", "R1");
+    assert(history_append(&h, &b) == ARMS_OK);
+    assert(history_append(&h, &c) == ARMS_OK);
+    assert(history_count(&h) == 3);
+    assert(strcmp(history_at(&h, 0)->flight_id, "A") == 0);
+    assert(strcmp(history_at(&h, 1)->flight_id, "B") == 0);
+    assert(strcmp(history_at(&h, 2)->flight_id, "C") == 0);
+    assert(history_at(&h, 3) == NULL && history_at(&h, -1) == NULL);
+
+    /* search */
+    assert(strcmp(history_find(&h, "B")->runway_id, "R2") == 0);
+    assert(history_find(&h, "NOPE") == NULL);
+
+    /* bad arguments */
+    assert(history_append(NULL, &a) == ARMS_ERR_INVALID_ARG);
+    assert(history_append(&h, NULL) == ARMS_ERR_INVALID_ARG);
+    assert(history_find(&h, NULL) == NULL && history_find(NULL, "A") == NULL);
+    assert(history_count(NULL) == 0);
+
+    /* failed allocation leaves the list untouched */
+    MovementNode *old_tail = h.tail;
+    history_fail_next_alloc = 1;
+    assert(history_append(&h, &a) == ARMS_ERR_NO_MEMORY);
+    assert(history_count(&h) == 3 && h.tail == old_tail && old_tail->next == NULL);
+    assert(history_append(&h, &a) == ARMS_OK);   /* hook fires only once */
+    assert(history_count(&h) == 4);
+
+    /* list output */
+    FILE *f = fopen(SCRATCH_FILE, "w+");
+    assert(f != NULL);
+    history_list(f, &h);
+    char buf[1024];
+    read_back(f, buf, sizeof buf);
+    fclose(f);
+    assert(strstr(buf, "1. A") != NULL && strstr(buf, "runway=R2") != NULL);
+
+    /* clear */
+    history_clear(&h);
+    assert(history_count(&h) == 0 && h.head == NULL && h.tail == NULL);
+    assert(history_find(&h, "A") == NULL);
+    assert(history_append(&h, &a) == ARMS_OK && history_count(&h) == 1);   /* reusable */
+    history_clear(&h);
+    history_clear(&h);   /* clearing an empty list is fine */
+}
+
+static void test_history_from_completion(void)
+{
+    Sys y;
+    char fid[ID_MAX_LEN + 1], rid[ID_MAX_LEN + 1];
+    sys_init(&y);
+    assert(runway_add(&y.rs, "R1", AIRCRAFT_LARGE) == ARMS_OK);
+    sys_flight(&y, "F1", FLIGHT_ARRIVAL, AIRCRAFT_MEDIUM);
+    sys_flight(&y, "F2", FLIGHT_DEPARTURE, AIRCRAFT_SMALL);
+
+    /* Nothing is recorded before completion, including by a cancelled SCHEDULED flight. */
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK && strcmp(fid, "F1") == 0);
+    assert(sys_cancel(&y, "F1") == ARMS_OK);
+    assert(history_count(&y.hist) == 0);
+
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK && strcmp(fid, "F2") == 0);
+    assert(ops_start(&y.fs, &y.rs, "F2") == ARMS_OK);
+    assert(history_count(&y.hist) == 0);
+    y.fs.now = 7;
+    assert(ops_complete(&y.fs, &y.rs, &y.hist, "F2") == ARMS_OK);
+
+    /* Exactly one record, with the runway captured before it was cleared. */
+    assert(history_count(&y.hist) == 1);
+    const Movement *m = history_find(&y.hist, "F2");
+    assert(m != NULL);
+    assert(m->type == FLIGHT_DEPARTURE && m->category == AIRCRAFT_SMALL);
+    assert(strcmp(m->runway_id, "R1") == 0);
+    assert(m->request_seq == flight_find(&y.fs, "F2")->request_seq);
+    assert(m->request_tick == flight_find(&y.fs, "F2")->request_tick);
+    assert(m->completed_tick == 7);
+    assert(flight_find(&y.fs, "F2")->runway_id[0] == '\0');
+
+    /* Repeated completion is rejected and adds nothing. */
+    assert(ops_complete(&y.fs, &y.rs, &y.hist, "F2") == ARMS_ERR_INVALID_TRANSITION);
+    assert(history_count(&y.hist) == 1);
+    assert(ops_complete(&y.fs, &y.rs, NULL, "F2") == ARMS_ERR_INVALID_ARG);
+
+    /* History survives the runway being released and reused by a later flight. */
+    sys_flight(&y, "F3", FLIGHT_ARRIVAL, AIRCRAFT_LARGE);
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK && strcmp(fid, "F3") == 0);
+    assert(runway_find(&y.rs, "R1")->status == RUNWAY_OCCUPIED);
+    assert(strcmp(history_find(&y.hist, "F2")->runway_id, "R1") == 0);
+    assert(ops_start(&y.fs, &y.rs, "F3") == ARMS_OK);
+    assert(ops_complete(&y.fs, &y.rs, &y.hist, "F3") == ARMS_OK);
+    assert(history_count(&y.hist) == 2);
+    assert(strcmp(history_at(&y.hist, 0)->flight_id, "F2") == 0);
+    assert(strcmp(history_at(&y.hist, 1)->flight_id, "F3") == 0);
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+
+    history_clear(&y.hist);
+}
+
+static void test_history_alloc_failure_in_completion(void)
+{
+    Sys y, before;
+    char fid[ID_MAX_LEN + 1], rid[ID_MAX_LEN + 1];
+    sys_init(&y);
+    assert(runway_add(&y.rs, "R1", AIRCRAFT_LARGE) == ARMS_OK);
+    sys_flight(&y, "OLD", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK);
+    assert(ops_start(&y.fs, &y.rs, "OLD") == ARMS_OK);
+    assert(ops_complete(&y.fs, &y.rs, &y.hist, "OLD") == ARMS_OK);
+
+    sys_flight(&y, "NEW", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK);
+    assert(ops_start(&y.fs, &y.rs, "NEW") == ARMS_OK);
+
+    /* Allocation fails: the flight stays IN_OPERATION on R1 and the history is unchanged. */
+    snap_take(&y, &before);
+    history_fail_next_alloc = 1;
+    assert(ops_complete(&y.fs, &y.rs, &y.hist, "NEW") == ARMS_ERR_NO_MEMORY);
+    assert(snap_same(&y, &before));
+    assert(flight_find(&y.fs, "NEW")->state == STATE_IN_OPERATION);
+    assert(strcmp(flight_find(&y.fs, "NEW")->runway_id, "R1") == 0);
+    assert(runway_find(&y.rs, "R1")->status == RUNWAY_OCCUPIED);
+    assert(history_count(&y.hist) == 1 && history_find(&y.hist, "NEW") == NULL);
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+
+    /* A retry succeeds and records the right runway. */
+    assert(ops_complete(&y.fs, &y.rs, &y.hist, "NEW") == ARMS_OK);
+    assert(history_count(&y.hist) == 2);
+    assert(strcmp(history_find(&y.hist, "NEW")->runway_id, "R1") == 0);
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+
+    history_clear(&y.hist);
+}
+
 int main(void)
 {
     test_ids_and_common();
@@ -1705,6 +1869,9 @@ int main(void)
     test_ops_cancel();
     test_ops_atomic_failures();
     test_ops_invariant_checker();
+    test_history_list_basic();
+    test_history_from_completion();
+    test_history_alloc_failure_in_completion();
 
     printf("All core tests passed.\n");
     return 0;

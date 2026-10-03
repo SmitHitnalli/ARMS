@@ -8,7 +8,7 @@ TARGET  = $(BUILD)/arms.exe
 TEST    = $(BUILD)/test_core.exe
 
 # Core modules: no GTK, shared by the app and the tests.
-CORE    = src/common.c src/flight.c src/runway.c src/queue.c src/request.c src/cqueue.c src/holding.c src/heap.c src/scheduler.c src/operations.c
+CORE    = src/common.c src/flight.c src/runway.c src/queue.c src/request.c src/cqueue.c src/holding.c src/heap.c src/scheduler.c src/history.c src/operations.c
 HEADERS = $(wildcard include/*.h)
 
 all: $(TARGET)
@@ -19,7 +19,7 @@ $(TARGET): src/main.c $(CORE) $(HEADERS)
 
 $(TEST): tests/test_core.c $(CORE) $(HEADERS)
 	mkdir -p $(BUILD)
-	$(CC) $(BASE) tests/test_core.c $(CORE) -o $@
+	$(CC) $(BASE) -DARMS_TESTING tests/test_core.c $(CORE) -o $@
 
 test: $(TEST)
 	./$(TEST)

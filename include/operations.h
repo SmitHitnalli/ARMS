@@ -3,6 +3,7 @@
 
 #include "common.h"
 #include "flight.h"
+#include "history.h"
 #include "holding.h"
 #include "request.h"
 #include "runway.h"
@@ -36,9 +37,12 @@ ArmsStatus ops_schedule_next(Scheduler *s, FlightStore *fs, RunwayStore *rs,
  * NOT_OCCUPIED (runway link is broken). */
 ArmsStatus ops_start(FlightStore *fs, RunwayStore *rs, const char *flight_id);
 
-/* IN_OPERATION -> COMPLETED, releases the runway and clears runway_id. Same errors as
- * ops_start (INVALID_TRANSITION if not IN_OPERATION). */
-ArmsStatus ops_complete(FlightStore *fs, RunwayStore *rs, const char *flight_id);
+/* IN_OPERATION -> COMPLETED, releases the runway and clears runway_id. Adds exactly one
+ * Movement record to mh (the runway ID is captured before it is cleared).
+ * Same errors as ops_start (INVALID_TRANSITION if not IN_OPERATION), plus INVALID_ARG for
+ * a NULL mh and NO_MEMORY if the record cannot be allocated; in that case nothing changes. */
+ArmsStatus ops_complete(FlightStore *fs, RunwayStore *rs, MovementHistory *mh,
+                        const char *flight_id);
 
 /* Cancels a flight and removes it from whatever it currently occupies:
  *   REGISTERED   -> just cancelled

@@ -81,9 +81,10 @@ ArmsStatus ops_start(FlightStore *fs, RunwayStore *rs, const char *flight_id)
     return flight_transition(fs, flight_id, STATE_IN_OPERATION);
 }
 
-ArmsStatus ops_complete(FlightStore *fs, RunwayStore *rs, const char *flight_id)
+ArmsStatus ops_complete(FlightStore *fs, RunwayStore *rs, MovementHistory *mh,
+                        const char *flight_id)
 {
-    if (fs == NULL || rs == NULL || flight_id == NULL)
+    if (fs == NULL || rs == NULL || mh == NULL || flight_id == NULL)
         return ARMS_ERR_INVALID_ARG;
 
     Flight *f = flight_find(fs, flight_id);
@@ -94,6 +95,19 @@ ArmsStatus ops_complete(FlightStore *fs, RunwayStore *rs, const char *flight_id)
     Runway *r = linked_runway(rs, f);
     if (r == NULL)
         return ARMS_ERR_NOT_OCCUPIED;
+
+    /* Record first, while runway_id is still set. If this fails nothing has changed. */
+    Movement m;
+    snprintf(m.flight_id, sizeof m.flight_id, "%s", f->id);
+    m.type = f->type;
+    m.category = f->category;
+    snprintf(m.runway_id, sizeof m.runway_id, "%s", r->id);
+    m.request_tick = f->request_tick;
+    m.request_seq = f->request_seq;
+    m.completed_tick = fs->now;
+    ArmsStatus st = history_append(mh, &m);
+    if (st != ARMS_OK)
+        return st;
 
     runway_release(rs, r->id);
     flight_transition(fs, flight_id, STATE_COMPLETED);
