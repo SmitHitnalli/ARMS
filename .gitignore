@@ -1,0 +1,46 @@
+# Compiled output
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+*.pdb
+*.ilk
+*.exp
+*.d
+
+# Build folders
+build/
+bin/
+obj/
+out/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.vs/
+*.code-workspace
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Logs and temp
+*.log
+*.tmp
+*.bak
+
+# Generated runtime data
+data/*.dat
+data/*.bin
+!data/.gitkeep
+
+# Claude Code local settings
+.claude/settings.local.json
