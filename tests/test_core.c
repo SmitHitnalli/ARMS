@@ -16,6 +16,8 @@
 #include "history.h"
 #include "reports.h"
 #include "graph.h"
+#include "system.h"
+#include "persist.h"
 
 /* Test-only hook defined in history.c when built with -DARMS_TESTING. */
 extern int history_fail_next_alloc;
@@ -2275,6 +2277,464 @@ static void test_graph_unchanged_by_traversal(void)
     assert(memcmp(&before, &g, sizeof g) == 0);
 }
 
+/* ---------- Phase 10: persistence ---------- */
+
+#define SAVE_FILE "build/test_persist.dat"
+#define BAD_FILE  "build/test_persist_bad.dat"
+#define TEXT_MAX  16384
+
+static void remove_save_files(const char *path)
+{
+    char p[128];
+    remove(path);
+    snprintf(p, sizeof p, "%s.tmp", path);
+    remove(p);
+    snprintf(p, sizeof p, "%s.bak", path);
+    remove(p);
+}
+
+static void read_file(const char *path, char *buf, size_t size)
+{
+    FILE *f = fopen(path, "r");
+    assert(f != NULL);
+    size_t n = fread(buf, 1, size - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+}
+
+static void write_file(const char *path, const char *text, size_t len)
+{
+    FILE *f = fopen(path, "w");
+    assert(f != NULL);
+    assert(fwrite(text, 1, len, f) == len);
+    fclose(f);
+}
+
+static int file_exists(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+        return 0;
+    fclose(f);
+    return 1;
+}
+
+/* Copies src to out with the first occurrence of `from` replaced by `to`. */
+static void mutate(const char *src, const char *from, const char *to, char *out, size_t size)
+{
+    const char *p = strstr(src, from);
+    assert(p != NULL);
+    size_t head = (size_t)(p - src);
+    const char *tail = p + strlen(from);
+    assert(head + strlen(to) + strlen(tail) < size);
+    memcpy(out, src, head);
+    strcpy(out + head, to);
+    strcpy(out + head + strlen(to), tail);
+}
+
+static void add_and_submit(ArmsSystem *s, const char *id, FlightType t, AircraftCategory c)
+{
+    assert(flight_add(&s->flights, id, t, c) == ARMS_OK);
+    assert(request_submit(&s->requests, &s->flights, id) == ARMS_OK);
+}
+
+/* Runs the highest-priority queued flight through schedule -> start -> complete. */
+static void run_to_completion(ArmsSystem *s, int done_tick)
+{
+    char fid[ID_MAX_LEN + 1], rid[ID_MAX_LEN + 1];
+    assert(scheduler_pull(&s->scheduler, &s->requests, &s->flights) == ARMS_OK);
+    assert(ops_schedule_next(&s->scheduler, &s->flights, &s->runways, fid, rid) == ARMS_OK);
+    assert(ops_start(&s->flights, &s->runways, fid) == ARMS_OK);
+    s->flights.now = done_tick;
+    assert(ops_complete(&s->flights, &s->runways, &s->history, fid) == ARMS_OK);
+}
+
+/* Deterministic system with every FlightState, a wrapped holding queue, a landing queue whose
+ * order differs from request_seq order, a heap member, history and a graph. 15 flights. */
+static void build_full_system(ArmsSystem *s)
+{
+    char fid[ID_MAX_LEN + 1], rid[ID_MAX_LEN + 1];
+    arms_system_init(s);
+
+    assert(runway_add(&s->runways, "R1", AIRCRAFT_LARGE) == ARMS_OK);
+    assert(runway_add(&s->runways, "R2", AIRCRAFT_MEDIUM) == ARMS_OK);
+    assert(runway_add(&s->runways, "R3", AIRCRAFT_SMALL) == ARMS_OK);
+    assert(runway_set_status(&s->runways, "R3", RUNWAY_CLOSED) == ARMS_OK);
+
+    s->flights.now = 1;
+    add_and_submit(s, "C1", FLIGHT_ARRIVAL, AIRCRAFT_MEDIUM);
+    run_to_completion(s, 4);
+    s->flights.now = 5;
+    add_and_submit(s, "C2", FLIGHT_DEPARTURE, AIRCRAFT_SMALL);
+    run_to_completion(s, 9);
+
+    /* HEAP1 -> R1 (IN_OPERATION), HEAP3 -> R2 (SCHEDULED), HEAP2 stays in the heap. */
+    add_and_submit(s, "HEAP1", FLIGHT_ARRIVAL, AIRCRAFT_LARGE);
+    add_and_submit(s, "HEAP2", FLIGHT_DEPARTURE, AIRCRAFT_SMALL);
+    add_and_submit(s, "HEAP3", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    assert(scheduler_pull(&s->scheduler, &s->requests, &s->flights) == ARMS_OK);
+    assert(scheduler_set_emergency(&s->scheduler, &s->flights, "HEAP1", EMERGENCY_ACTIVE) == ARMS_OK);
+    assert(scheduler_set_fuel(&s->scheduler, &s->flights, "HEAP3", FUEL_LOW) == ARMS_OK);
+    assert(ops_schedule_next(&s->scheduler, &s->flights, &s->runways, fid, rid) == ARMS_OK);
+    assert(strcmp(fid, "HEAP1") == 0 && strcmp(rid, "R1") == 0);
+    assert(ops_schedule_next(&s->scheduler, &s->flights, &s->runways, fid, rid) == ARMS_OK);
+    assert(strcmp(fid, "HEAP3") == 0 && strcmp(rid, "R2") == 0);
+    assert(ops_start(&s->flights, &s->runways, "HEAP1") == ARMS_OK);
+
+    assert(flight_add(&s->flights, "REG1", FLIGHT_DEPARTURE, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(flight_add(&s->flights, "X1", FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(ops_cancel(&s->scheduler, &s->holding, &s->requests, &s->flights, &s->runways, "X1") == ARMS_OK);
+
+    add_and_submit(s, "QL1", FLIGHT_ARRIVAL, AIRCRAFT_MEDIUM);
+    add_and_submit(s, "QL2", FLIGHT_ARRIVAL, AIRCRAFT_MEDIUM);
+    add_and_submit(s, "QL3", FLIGHT_ARRIVAL, AIRCRAFT_MEDIUM);
+    add_and_submit(s, "QT1", FLIGHT_DEPARTURE, AIRCRAFT_LARGE);
+    add_and_submit(s, "QT2", FLIGHT_DEPARTURE, AIRCRAFT_LARGE);
+    add_and_submit(s, "H1", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    add_and_submit(s, "H2", FLIGHT_DEPARTURE, AIRCRAFT_SMALL);
+    add_and_submit(s, "H3", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+
+    /* Move the holding queue's front/rear near the end of the array so H1..H3 wrap around. */
+    for (int i = 0; i < CQUEUE_CAPACITY - 2; i++) {
+        assert(cqueue_enqueue(&s->holding.queue, "DUMMY") == ARMS_OK);
+        assert(cqueue_dequeue(&s->holding.queue, fid) == ARMS_OK);
+    }
+    /* QL1 goes to holding and back: it ends up at the rear of landing, after QL3. */
+    assert(holding_enter(&s->holding, &s->requests, &s->flights, "QL1") == ARMS_OK);
+    assert(holding_leave(&s->holding, &s->requests, &s->flights, "QL1") == ARMS_OK);
+    assert(holding_enter(&s->holding, &s->requests, &s->flights, "H1") == ARMS_OK);
+    assert(holding_enter(&s->holding, &s->requests, &s->flights, "H2") == ARMS_OK);
+    assert(holding_enter(&s->holding, &s->requests, &s->flights, "H3") == ARMS_OK);
+
+    assert(graph_add_node(&s->graph, "RWY1", "Runway 1 exit") == ARMS_OK);
+    assert(graph_add_node(&s->graph, "TWY-A", "Taxiway A") == ARMS_OK);
+    assert(graph_add_node(&s->graph, "GATE1", "Gate 1") == ARMS_OK);
+    assert(graph_add_node(&s->graph, "HOLD1", NULL) == ARMS_OK);
+    assert(graph_add_edge(&s->graph, "RWY1", "TWY-A") == ARMS_OK);
+    assert(graph_add_edge(&s->graph, "TWY-A", "GATE1") == ARMS_OK);
+
+    assert(flight_count(&s->flights) == 15);
+    assert(ops_check_invariants(&s->flights, &s->runways, &s->scheduler));
+}
+
+/* No child may have higher priority than its parent. */
+static int heap_is_valid(const MaxHeap *h, FlightStore *fs)
+{
+    for (int i = 1; i < h->count; i++) {
+        const Flight *child = flight_find(fs, h->ids[i]);
+        const Flight *parent = flight_find(fs, h->ids[(i - 1) / 2]);
+        if (child == NULL || parent == NULL || flight_priority_higher(child, parent))
+            return 0;
+    }
+    return 1;
+}
+
+/* Logical equality: same data, same queue order, same heap members, same graph. */
+static void assert_systems_equal(const ArmsSystem *a, const ArmsSystem *b)
+{
+    assert(a->flights.count == b->flights.count);
+    assert(a->flights.now == b->flights.now);
+    assert(a->flights.next_seq == b->flights.next_seq);
+    for (int i = 0; i < a->flights.count; i++) {
+        const Flight *x = &a->flights.items[i], *y = &b->flights.items[i];
+        assert(strcmp(x->id, y->id) == 0);
+        assert(x->type == y->type && x->category == y->category && x->state == y->state);
+        assert(x->emergency == y->emergency && x->fuel == y->fuel);
+        assert(x->request_tick == y->request_tick && x->request_seq == y->request_seq);
+        assert(strcmp(x->runway_id, y->runway_id) == 0);
+    }
+
+    assert(a->runways.count == b->runways.count);
+    for (int i = 0; i < a->runways.count; i++) {
+        const Runway *x = &a->runways.items[i], *y = &b->runways.items[i];
+        assert(strcmp(x->id, y->id) == 0);
+        assert(x->status == y->status && x->max_category == y->max_category);
+        assert(strcmp(x->current_flight_id, y->current_flight_id) == 0);
+    }
+
+    assert(queue_count(&a->requests.landing) == queue_count(&b->requests.landing));
+    for (int i = 0; i < queue_count(&a->requests.landing); i++)
+        assert(strcmp(queue_at(&a->requests.landing, i), queue_at(&b->requests.landing, i)) == 0);
+    assert(queue_count(&a->requests.takeoff) == queue_count(&b->requests.takeoff));
+    for (int i = 0; i < queue_count(&a->requests.takeoff); i++)
+        assert(strcmp(queue_at(&a->requests.takeoff, i), queue_at(&b->requests.takeoff, i)) == 0);
+    assert(cqueue_count(&a->holding.queue) == cqueue_count(&b->holding.queue));
+    for (int i = 0; i < cqueue_count(&a->holding.queue); i++)
+        assert(strcmp(cqueue_at(&a->holding.queue, i), cqueue_at(&b->holding.queue, i)) == 0);
+
+    assert(heap_count(&a->scheduler.heap) == heap_count(&b->scheduler.heap));
+    for (int i = 0; i < a->scheduler.heap.count; i++)
+        assert(heap_contains(&b->scheduler.heap, a->scheduler.heap.ids[i]));
+
+    assert(history_count(&a->history) == history_count(&b->history));
+    for (int i = 0; i < history_count(&a->history); i++) {
+        const Movement *x = history_at(&a->history, i), *y = history_at(&b->history, i);
+        assert(strcmp(x->flight_id, y->flight_id) == 0 && strcmp(x->runway_id, y->runway_id) == 0);
+        assert(x->type == y->type && x->category == y->category);
+        assert(x->request_tick == y->request_tick && x->request_seq == y->request_seq);
+        assert(x->completed_tick == y->completed_tick);
+    }
+
+    assert(a->graph.count == b->graph.count);
+    for (int i = 0; i < a->graph.count; i++) {
+        assert(strcmp(a->graph.nodes[i].id, b->graph.nodes[i].id) == 0);
+        assert(strcmp(a->graph.nodes[i].label, b->graph.nodes[i].label) == 0);
+        for (int j = 0; j < a->graph.count; j++)
+            assert(a->graph.adj[i][j] == b->graph.adj[i][j]);
+    }
+}
+
+static void test_persist_empty_round_trip(void)
+{
+    ArmsSystem empty, dest;
+    arms_system_init(&empty);
+    build_full_system(&dest);          /* load must replace this completely */
+    remove_save_files(SAVE_FILE);
+
+    assert(persist_save(SAVE_FILE, &empty) == ARMS_OK);
+    assert(persist_load(SAVE_FILE, &dest) == ARMS_OK);
+    assert(dest.flights.count == 0 && history_count(&dest.history) == 0);
+    assert_systems_equal(&dest, &empty);
+
+    arms_system_clear(&dest);
+    arms_system_clear(&empty);
+}
+
+static void test_persist_full_round_trip(void)
+{
+    ArmsSystem a, b;
+    build_full_system(&a);
+    arms_system_init(&b);
+    remove_save_files(SAVE_FILE);
+
+    /* The holding queue really wraps: rear is behind front in the array. */
+    assert(a.holding.queue.rear < a.holding.queue.front);
+
+    assert(persist_save(SAVE_FILE, &a) == ARMS_OK);
+    assert(!file_exists(SAVE_FILE ".tmp"));    /* temp file is gone after a successful save */
+    assert(persist_load(SAVE_FILE, &b) == ARMS_OK);
+    assert_systems_equal(&a, &b);
+
+    /* Every FlightState survived. */
+    int seen = 0;
+    for (int i = 0; i < b.flights.count; i++)
+        seen |= 1 << b.flights.items[i].state;
+    assert(seen == (1 << STATE_COUNT) - 1);
+
+    /* Exact queue order, including a landing order that differs from request_seq order. */
+    assert(queue_count(&b.requests.landing) == 3);
+    assert(strcmp(queue_at(&b.requests.landing, 0), "QL2") == 0);
+    assert(strcmp(queue_at(&b.requests.landing, 1), "QL3") == 0);
+    assert(strcmp(queue_at(&b.requests.landing, 2), "QL1") == 0);
+    assert(flight_find(&b.flights, "QL1")->request_seq < flight_find(&b.flights, "QL2")->request_seq);
+    assert(queue_count(&b.requests.takeoff) == 2);
+    assert(strcmp(queue_at(&b.requests.takeoff, 0), "QT1") == 0);
+    assert(strcmp(queue_at(&b.requests.takeoff, 1), "QT2") == 0);
+    assert(cqueue_count(&b.holding.queue) == 3);
+    assert(strcmp(cqueue_at(&b.holding.queue, 0), "H1") == 0);
+    assert(strcmp(cqueue_at(&b.holding.queue, 1), "H2") == 0);
+    assert(strcmp(cqueue_at(&b.holding.queue, 2), "H3") == 0);
+
+    /* Heap membership and a valid heap. */
+    assert(heap_count(&b.scheduler.heap) == 1 && heap_contains(&b.scheduler.heap, "HEAP2"));
+    assert(heap_is_valid(&b.scheduler.heap, &b.flights));
+
+    /* Runway links, both directions. */
+    const Flight *h1 = flight_find(&b.flights, "HEAP1");
+    const Flight *h3 = flight_find(&b.flights, "HEAP3");
+    assert(h1->state == STATE_IN_OPERATION && strcmp(h1->runway_id, "R1") == 0);
+    assert(h3->state == STATE_SCHEDULED && strcmp(h3->runway_id, "R2") == 0);
+    assert(strcmp(runway_find(&b.runways, "R1")->current_flight_id, "HEAP1") == 0);
+    assert(strcmp(runway_find(&b.runways, "R2")->current_flight_id, "HEAP3") == 0);
+    assert(runway_find(&b.runways, "R3")->status == RUNWAY_CLOSED);
+    assert(ops_check_invariants(&b.flights, &b.runways, &b.scheduler));
+
+    /* History order. */
+    assert(history_count(&b.history) == 2);
+    assert(strcmp(history_at(&b.history, 0)->flight_id, "C1") == 0);
+    assert(strcmp(history_at(&b.history, 1)->flight_id, "C2") == 0);
+
+    /* Graph. */
+    assert(graph_node_count(&b.graph) == 4);
+    assert(strcmp(graph_node_at(&b.graph, 0)->label, "Runway 1 exit") == 0);
+    assert(graph_node_at(&b.graph, 3)->label[0] == '\0');
+    assert(graph_adjacent(&b.graph, "RWY1", "TWY-A") && graph_adjacent(&b.graph, "GATE1", "TWY-A"));
+    assert(!graph_adjacent(&b.graph, "RWY1", "GATE1"));
+    int order[MAX_NODES], n;
+    assert(graph_bfs(&b.graph, "RWY1", order, MAX_NODES, &n) == ARMS_OK && n == 3);
+
+    /* The loaded system still works: finish the in-operation flight. */
+    assert(ops_complete(&b.flights, &b.runways, &b.history, "HEAP1") == ARMS_OK);
+    assert(history_count(&b.history) == 3);
+    assert(runway_find(&b.runways, "R1")->status == RUNWAY_AVAILABLE);
+    assert(ops_check_invariants(&b.flights, &b.runways, &b.scheduler));
+
+    arms_system_clear(&a);
+    arms_system_clear(&b);
+    remove_save_files(SAVE_FILE);
+}
+
+static void test_persist_save_load_save(void)
+{
+    static char first[TEXT_MAX], second[TEXT_MAX], backup[TEXT_MAX];
+    ArmsSystem a, b;
+    build_full_system(&a);
+    arms_system_init(&b);
+    remove_save_files(SAVE_FILE);
+    remove_save_files(BAD_FILE);
+
+    assert(persist_save(SAVE_FILE, &a) == ARMS_OK);
+    assert(persist_load(SAVE_FILE, &b) == ARMS_OK);
+    assert(persist_save(BAD_FILE, &b) == ARMS_OK);
+    read_file(SAVE_FILE, first, sizeof first);
+    read_file(BAD_FILE, second, sizeof second);
+    assert(strncmp(first, "ARMS-SAVE 1\n", 12) == 0);
+    assert(strstr(first, "\nEND\n") != NULL);
+    assert(strcmp(first, second) == 0);
+
+    /* A second save keeps the first as .bak and leaves no .tmp behind. */
+    assert(persist_save(SAVE_FILE, &b) == ARMS_OK);
+    read_file(SAVE_FILE ".bak", backup, sizeof backup);
+    assert(strcmp(backup, first) == 0);
+    assert(!file_exists(SAVE_FILE ".tmp"));
+
+    arms_system_clear(&a);
+    arms_system_clear(&b);
+    remove_save_files(SAVE_FILE);
+    remove_save_files(BAD_FILE);
+}
+
+static void test_persist_capacity_round_trip(void)
+{
+    ArmsSystem a, b;
+    char id[ID_MAX_LEN + 1];
+    arms_system_init(&a);
+    arms_system_init(&b);
+    for (int i = 0; i < MAX_FLIGHTS; i++) {
+        snprintf(id, sizeof id, "F%d", i);
+        assert(flight_add(&a.flights, id, FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    }
+    remove_save_files(SAVE_FILE);
+    assert(persist_save(SAVE_FILE, &a) == ARMS_OK);
+    assert(persist_load(SAVE_FILE, &b) == ARMS_OK);
+    assert(flight_count(&b.flights) == MAX_FLIGHTS);
+    assert_systems_equal(&a, &b);
+    remove_save_files(SAVE_FILE);
+}
+
+static void test_persist_missing_and_io_errors(void)
+{
+    ArmsSystem dest, ref;
+    build_full_system(&dest);
+    build_full_system(&ref);
+    remove_save_files(SAVE_FILE);
+
+    assert(persist_load(SAVE_FILE, &dest) == ARMS_ERR_NOT_FOUND);
+    assert_systems_equal(&dest, &ref);
+    assert(persist_load(NULL, &dest) == ARMS_ERR_INVALID_ARG);
+    assert(persist_save(NULL, &dest) == ARMS_ERR_INVALID_ARG);
+
+    /* Directory does not exist: save fails with IO. */
+    assert(persist_save("build/no_such_dir/arms.dat", &dest) == ARMS_ERR_IO);
+
+    /* A label with a line break would corrupt the file: refused before anything is written. */
+    assert(graph_add_node(&dest.graph, "BAD", "two\nlines") == ARMS_OK);
+    assert(persist_save(SAVE_FILE, &dest) == ARMS_ERR_INVALID_ARG);
+    assert(!file_exists(SAVE_FILE) && !file_exists(SAVE_FILE ".tmp"));
+
+    arms_system_clear(&dest);
+    arms_system_clear(&ref);
+}
+
+typedef struct {
+    const char *from;
+    const char *to;
+    ArmsStatus  expect;
+} Mutation;
+
+static void test_persist_rejects_bad_files(void)
+{
+    static char good[TEXT_MAX], bad[TEXT_MAX];
+    static const Mutation cases[] = {
+        /* header / syntax */
+        { "ARMS-SAVE 1", "ARMS-SAVE 2", ARMS_ERR_FORMAT },
+        { "FLIGHTS 15 ", "FLIGHTS x ", ARMS_ERR_FORMAT },
+        { "R R1 OCCUPIED LARGE HEAP1", "R R1 OCCUPIED LARGE", ARMS_ERR_FORMAT },
+        { "END\n", "", ARMS_ERR_FORMAT },                        /* truncated: no END */
+        { "END\n", "END\nextra\n", ARMS_ERR_FORMAT },            /* trailing junk */
+        /* values */
+        { "F C1 ARRIVAL", "F C1 SIDEWAYS", ARMS_ERR_FORMAT },    /* bad enum */
+        { "F REG1 ", "F reg1 ", ARMS_ERR_INVALID_ID },
+        /* duplicates */
+        { "F C2 ", "F C1 ", ARMS_ERR_DUPLICATE },
+        { "M C2 ", "M C1 ", ARMS_ERR_DUPLICATE },
+        /* two submitted flights sharing a non-zero request_seq (HEAP1 has 2, HEAP2 has 3) */
+        { "F HEAP2 DEPARTURE SMALL WAITING NONE NORMAL 9 3 ~",
+          "F HEAP2 DEPARTURE SMALL WAITING NONE NORMAL 9 2 ~", ARMS_ERR_FORMAT },
+        /* capacity */
+        { "FLIGHTS 15 ", "FLIGHTS 101 ", ARMS_ERR_FULL },
+        { "RUNWAYS 3\n", "RUNWAYS 11\n", ARMS_ERR_FULL },
+        { "NODES 4\n", "NODES 17\n", ARMS_ERR_FULL },
+        { "LANDING 3\n", "LANDING 101\n", ARMS_ERR_FULL },
+        /* duplicate active-structure membership */
+        { "L QL2\nL QL3\n", "L QL2\nL QL2\n", ARMS_ERR_DUPLICATE },
+        { "HEAP 1\nP HEAP2\n", "HEAP 2\nP HEAP2\nP QL1\n", ARMS_ERR_DUPLICATE },
+        /* wrong state / type for a structure, or missing membership */
+        { "LANDING 3\n", "LANDING 4\nL QT1\n", ARMS_ERR_FORMAT },         /* DEPARTURE in landing */
+        { "HEAP 1\nP HEAP2\n", "HEAP 1\nP HEAP1\n", ARMS_ERR_FORMAT },    /* IN_OPERATION in heap */
+        { "HOLDING 3\n", "HOLDING 4\nH REG1\n", ARMS_ERR_FORMAT },        /* REGISTERED in holding */
+        { "LANDING 3\nL QL2\nL QL3\nL QL1\n", "LANDING 2\nL QL2\nL QL3\n", ARMS_ERR_FORMAT },
+        /* runway links */
+        { "R R1 OCCUPIED LARGE HEAP1", "R R1 OCCUPIED LARGE HEAP3", ARMS_ERR_FORMAT },
+        { "R R1 OCCUPIED LARGE HEAP1", "R R1 AVAILABLE LARGE ~", ARMS_ERR_FORMAT },
+        { "M C1 ARRIVAL MEDIUM R1", "M C1 ARRIVAL MEDIUM R9", ARMS_ERR_FORMAT },
+        { "M C1 ", "M HEAP1 ", ARMS_ERR_FORMAT },                         /* flight not COMPLETED */
+        /* graph */
+        { "E RWY1 TWY-A", "E RWY1 NOPE", ARMS_ERR_FORMAT },
+        { "E RWY1 TWY-A\n", "E RWY1 TWY-A\nE TWY-A RWY1\n", ARMS_ERR_DUPLICATE },
+    };
+    ArmsSystem src, dest, ref;
+    build_full_system(&src);
+    build_full_system(&ref);
+    remove_save_files(SAVE_FILE);
+    assert(persist_save(SAVE_FILE, &src) == ARMS_OK);
+    read_file(SAVE_FILE, good, sizeof good);
+
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        mutate(good, cases[i].from, cases[i].to, bad, sizeof bad);
+        write_file(BAD_FILE, bad, strlen(bad));
+        build_full_system(&dest);
+        ArmsStatus st = persist_load(BAD_FILE, &dest);
+        if (st != cases[i].expect)
+            printf("bad-file case %zu (%s): got %s\n", i, cases[i].from, arms_status_str(st));
+        assert(st == cases[i].expect);
+        assert_systems_equal(&dest, &ref);           /* destination unchanged */
+        arms_system_clear(&dest);
+    }
+
+    /* Truncated mid-file, and an empty file. */
+    build_full_system(&dest);
+    write_file(BAD_FILE, good, strlen(good) / 2);
+    assert(persist_load(BAD_FILE, &dest) == ARMS_ERR_FORMAT);
+    write_file(BAD_FILE, "", 0);
+    assert(persist_load(BAD_FILE, &dest) == ARMS_ERR_FORMAT);
+    assert_systems_equal(&dest, &ref);
+    arms_system_clear(&dest);
+
+    /* History node allocation fails during load: NO_MEMORY, destination unchanged. */
+    build_full_system(&dest);
+    history_fail_next_alloc = 1;
+    assert(persist_load(SAVE_FILE, &dest) == ARMS_ERR_NO_MEMORY);
+    assert(history_fail_next_alloc == 0);
+    assert_systems_equal(&dest, &ref);
+    arms_system_clear(&dest);
+
+    arms_system_clear(&src);
+    arms_system_clear(&ref);
+    remove_save_files(SAVE_FILE);
+    remove_save_files(BAD_FILE);
+}
+
 int main(void)
 {
     test_ids_and_common();
@@ -2334,6 +2794,12 @@ int main(void)
     test_graph_full();
     test_graph_long_label_truncated();
     test_graph_unchanged_by_traversal();
+    test_persist_empty_round_trip();
+    test_persist_full_round_trip();
+    test_persist_save_load_save();
+    test_persist_capacity_round_trip();
+    test_persist_missing_and_io_errors();
+    test_persist_rejects_bad_files();
 
     printf("All core tests passed.\n");
     return 0;

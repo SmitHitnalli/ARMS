@@ -23,7 +23,9 @@ typedef enum {
     ARMS_ERR_INCOMPATIBLE,
     ARMS_ERR_EMPTY,
     ARMS_ERR_NO_RUNWAY,          /* flights are waiting but no compatible runway is free */
-    ARMS_ERR_NO_MEMORY           /* malloc failed; the call changed nothing */
+    ARMS_ERR_NO_MEMORY,          /* malloc failed; the call changed nothing */
+    ARMS_ERR_IO,                 /* a file could not be opened, written or renamed */
+    ARMS_ERR_FORMAT              /* a save file is malformed or internally inconsistent */
 } ArmsStatus;
 
 /* Returns 1 if id is 1-15 characters of A-Z, 0-9 or '-', else 0. */

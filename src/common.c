@@ -33,6 +33,8 @@ const char *arms_status_str(ArmsStatus s)
     case ARMS_ERR_EMPTY:             return "Queue is empty";
     case ARMS_ERR_NO_RUNWAY:         return "No available compatible runway";
     case ARMS_ERR_NO_MEMORY:         return "Out of memory";
+    case ARMS_ERR_IO:                return "File error";
+    case ARMS_ERR_FORMAT:            return "Save file is malformed or inconsistent";
     }
     return "Unknown status";
 }
