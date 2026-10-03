@@ -22,6 +22,13 @@ DSA visualizations must be optional/togglable or live in a separate developer vi
 - Compile with warnings enabled (e.g. `-Wall -Wextra`).
 - Test core modules independently from GTK.
 
+## Build environment (Windows)
+- Canonical build environment: MSYS2 UCRT64. Compiler/toolchain comes from `C:\msys64\ucrt64\bin`.
+- GUI toolkit: GTK 4. Use `pkg-config` for GTK4 compiler/linker flags.
+- Invoke `mingw32-make` directly in automated/Claude commands; do not rely on the interactive `make` alias.
+- Run build/run commands from an MSYS2-compatible shell, not plain PowerShell (the Makefile uses POSIX commands).
+- Do not mix MINGW64 libraries/toolchains with UCRT64 dependencies.
+
 ## Workflow
 - Work phase by phase.
 - Before a substantial implementation phase, explain the plan and affected files first.
