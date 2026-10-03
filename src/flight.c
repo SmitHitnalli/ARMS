@@ -4,12 +4,13 @@
 
 /* allowed[from][to] = 1 if the transition is valid.
  * Columns: REGISTERED, WAITING, HOLDING, SCHEDULED, IN_OPERATION, COMPLETED, CANCELLED.
- * SCHEDULED -> CANCELLED is intentionally 0 until Phase 6 can also release the runway. */
+ * SCHEDULED -> CANCELLED is allowed here, but it also needs the runway released:
+ * application code must cancel through ops_cancel(), not flight_transition(). */
 static const int allowed[STATE_COUNT][STATE_COUNT] = {
     /* REGISTERED   */ { 0, 1, 0, 0, 0, 0, 1 },
     /* WAITING      */ { 0, 0, 1, 1, 0, 0, 1 },
     /* HOLDING      */ { 0, 1, 0, 1, 0, 0, 1 },
-    /* SCHEDULED    */ { 0, 0, 0, 0, 1, 0, 0 },
+    /* SCHEDULED    */ { 0, 0, 0, 0, 1, 0, 1 },
     /* IN_OPERATION */ { 0, 0, 0, 0, 0, 1, 0 },
     /* COMPLETED    */ { 0, 0, 0, 0, 0, 0, 0 },
     /* CANCELLED    */ { 0, 0, 0, 0, 0, 0, 0 }
@@ -54,6 +55,7 @@ ArmsStatus flight_add(FlightStore *fs, const char *id, FlightType type,
     f->fuel = FUEL_NORMAL;
     f->request_tick = 0;
     f->request_seq = 0;
+    f->runway_id[0] = '\0';
     fs->count++;
     return ARMS_OK;
 }

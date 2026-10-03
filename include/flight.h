@@ -32,6 +32,7 @@ typedef struct {
     FuelLevel        fuel;        /* default FUEL_NORMAL */
     int              request_tick; /* logical time of the runway request (set by request_submit) */
     unsigned         request_seq;  /* unique, increasing request number (set by request_submit) */
+    char             runway_id[ID_MAX_LEN + 1];   /* "" = no active runway; set only by operations.c */
 } Flight;
 
 typedef struct {

@@ -12,13 +12,14 @@
 #include "holding.h"
 #include "heap.h"
 #include "scheduler.h"
+#include "operations.h"
 
 /* Independent copy of the approved transition table, to check flight.c against. */
 static const int expected[STATE_COUNT][STATE_COUNT] = {
     { 0, 1, 0, 0, 0, 0, 1 },
     { 0, 0, 1, 1, 0, 0, 1 },
     { 0, 1, 0, 1, 0, 0, 1 },
-    { 0, 0, 0, 0, 1, 0, 0 },
+    { 0, 0, 0, 0, 1, 0, 1 },
     { 0, 0, 0, 0, 0, 1, 0 },
     { 0, 0, 0, 0, 0, 0, 0 },
     { 0, 0, 0, 0, 0, 0, 0 }
@@ -177,7 +178,7 @@ static void test_flight_transitions(void)
     }
 
     /* Cancellation rules called out in the design. */
-    assert(!flight_transition_allowed(STATE_SCHEDULED, STATE_CANCELLED));
+    assert(flight_transition_allowed(STATE_SCHEDULED, STATE_CANCELLED));   /* via ops_cancel */
     assert(!flight_transition_allowed(STATE_IN_OPERATION, STATE_CANCELLED));
 
     /* Bad arguments. */
@@ -1278,6 +1279,390 @@ static void test_scheduler_hold_full_holding(void)
     assert(flight_find(&fs, "WAIT")->state == STATE_WAITING);
 }
 
+/* ---------- Phase 6: operations ---------- */
+
+typedef struct {
+    FlightStore   fs;
+    RunwayStore   rs;
+    RequestQueues rq;
+    HoldingQueue  hq;
+    Scheduler     s;
+} Sys;
+
+static void sys_init(Sys *y)
+{
+    flight_store_init(&y->fs);
+    runway_store_init(&y->rs);
+    request_init(&y->rq);
+    holding_init(&y->hq);
+    scheduler_init(&y->s);
+}
+
+/* Registers a flight and submits it: WAITING, in a normal queue. */
+static void sys_flight(Sys *y, const char *id, FlightType t, AircraftCategory c)
+{
+    assert(flight_add(&y->fs, id, t, c) == ARMS_OK);
+    assert(request_submit(&y->rq, &y->fs, id) == ARMS_OK);
+}
+
+static void sys_pull(Sys *y)
+{
+    assert(scheduler_pull(&y->s, &y->rq, &y->fs) == ARMS_OK);
+}
+
+static ArmsStatus sys_schedule(Sys *y, char *fid, char *rid)
+{
+    sys_pull(y);
+    return ops_schedule_next(&y->s, &y->fs, &y->rs, fid, rid);
+}
+
+static ArmsStatus sys_cancel(Sys *y, const char *id)
+{
+    return ops_cancel(&y->s, &y->hq, &y->rq, &y->fs, &y->rs, id);
+}
+
+/* Byte-for-byte copy of every structure, to prove a failed call changed nothing. */
+static void snap_take(const Sys *y, Sys *copy) { memcpy(copy, y, sizeof *copy); }
+static int  snap_same(const Sys *a, const Sys *b) { return memcmp(a, b, sizeof *a) == 0; }
+
+static void test_ops_schedule_basic(void)
+{
+    Sys y;
+    char fid[ID_MAX_LEN + 1], rid[ID_MAX_LEN + 1];
+    sys_init(&y);
+
+    assert(runway_add(&y.rs, "R1", AIRCRAFT_LARGE) == ARMS_OK);
+    sys_flight(&y, "F1", FLIGHT_ARRIVAL, AIRCRAFT_MEDIUM);
+    assert(flight_find(&y.fs, "F1")->runway_id[0] == '\0');
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK);
+    assert(strcmp(fid, "F1") == 0 && strcmp(rid, "R1") == 0);
+    Flight *f = flight_find(&y.fs, "F1");
+    assert(f->state == STATE_SCHEDULED && strcmp(f->runway_id, "R1") == 0);
+    Runway *r = runway_find(&y.rs, "R1");
+    assert(r->status == RUNWAY_OCCUPIED && strcmp(r->current_flight_id, "F1") == 0);
+    assert(scheduler_count(&y.s) == 0);
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+
+    assert(sys_schedule(&y, fid, rid) == ARMS_ERR_EMPTY);
+    assert(ops_schedule_next(NULL, &y.fs, &y.rs, fid, rid) == ARMS_ERR_INVALID_ARG);
+    assert(ops_schedule_next(&y.s, &y.fs, &y.rs, NULL, rid) == ARMS_ERR_INVALID_ARG);
+}
+
+static void test_ops_priority_order(void)
+{
+    Sys y;
+    char fid[ID_MAX_LEN + 1], rid[ID_MAX_LEN + 1];
+    sys_init(&y);
+
+    assert(runway_add(&y.rs, "R1", AIRCRAFT_LARGE) == ARMS_OK);
+    sys_flight(&y, "FIRST", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    sys_flight(&y, "URGENT", FLIGHT_DEPARTURE, AIRCRAFT_SMALL);
+    sys_pull(&y);
+    assert(scheduler_set_emergency(&y.s, &y.fs, "URGENT", EMERGENCY_ACTIVE) == ARMS_OK);
+
+    assert(ops_schedule_next(&y.s, &y.fs, &y.rs, fid, rid) == ARMS_OK);
+    assert(strcmp(fid, "URGENT") == 0);
+    assert(flight_find(&y.fs, "FIRST")->state == STATE_WAITING && scheduler_contains(&y.s, "FIRST"));
+}
+
+static void test_ops_runway_selection(void)
+{
+    Sys y;
+    char fid[ID_MAX_LEN + 1], rid[ID_MAX_LEN + 1];
+    sys_init(&y);
+
+    assert(runway_add(&y.rs, "R1", AIRCRAFT_SMALL) == ARMS_OK);
+    assert(runway_add(&y.rs, "R2", AIRCRAFT_MEDIUM) == ARMS_OK);
+    assert(runway_add(&y.rs, "R3", AIRCRAFT_LARGE) == ARMS_OK);
+
+    /* First compatible AVAILABLE runway in store order: R1 is too small, so R2. */
+    sys_flight(&y, "A", FLIGHT_ARRIVAL, AIRCRAFT_MEDIUM);
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK && strcmp(rid, "R2") == 0);
+
+    /* R2 is now occupied, so the next medium flight moves on to R3. */
+    sys_flight(&y, "B", FLIGHT_ARRIVAL, AIRCRAFT_MEDIUM);
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK && strcmp(rid, "R3") == 0);
+
+    /* Only R1 is free and it is too small for C; D is small and can use it. */
+    sys_flight(&y, "C", FLIGHT_ARRIVAL, AIRCRAFT_MEDIUM);
+    assert(sys_schedule(&y, fid, rid) == ARMS_ERR_NO_RUNWAY);
+    sys_flight(&y, "D", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK);
+    assert(strcmp(fid, "D") == 0 && strcmp(rid, "R1") == 0);
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+}
+
+static void test_ops_runway_unavailable(void)
+{
+    Sys y, before;
+    char fid[ID_MAX_LEN + 1], rid[ID_MAX_LEN + 1];
+    sys_init(&y);
+
+    /* Closed runway. */
+    assert(runway_add(&y.rs, "R1", AIRCRAFT_LARGE) == ARMS_OK);
+    assert(runway_set_status(&y.rs, "R1", RUNWAY_CLOSED) == ARMS_OK);
+    sys_flight(&y, "F1", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    sys_pull(&y);
+    snap_take(&y, &before);
+    assert(ops_schedule_next(&y.s, &y.fs, &y.rs, fid, rid) == ARMS_ERR_NO_RUNWAY);
+    assert(snap_same(&y, &before));
+    assert(flight_find(&y.fs, "F1")->state == STATE_WAITING && scheduler_contains(&y.s, "F1"));
+
+    /* Reopened: now it works. */
+    assert(runway_set_status(&y.rs, "R1", RUNWAY_AVAILABLE) == ARMS_OK);
+    assert(ops_schedule_next(&y.s, &y.fs, &y.rs, fid, rid) == ARMS_OK);
+
+    /* Occupied runway, plus a free runway that is too small for the flight. */
+    assert(runway_add(&y.rs, "R2", AIRCRAFT_SMALL) == ARMS_OK);
+    sys_flight(&y, "F2", FLIGHT_ARRIVAL, AIRCRAFT_LARGE);
+    sys_pull(&y);
+    snap_take(&y, &before);
+    assert(ops_schedule_next(&y.s, &y.fs, &y.rs, fid, rid) == ARMS_ERR_NO_RUNWAY);
+    assert(snap_same(&y, &before));
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+}
+
+static void test_ops_blocked_top_skipped(void)
+{
+    Sys y;
+    char fid[ID_MAX_LEN + 1], rid[ID_MAX_LEN + 1];
+    sys_init(&y);
+
+    assert(runway_add(&y.rs, "R1", AIRCRAFT_SMALL) == ARMS_OK);
+    sys_flight(&y, "BIG", FLIGHT_ARRIVAL, AIRCRAFT_LARGE);
+    sys_flight(&y, "SML", FLIGHT_DEPARTURE, AIRCRAFT_SMALL);
+    sys_pull(&y);
+    assert(scheduler_set_emergency(&y.s, &y.fs, "BIG", EMERGENCY_ACTIVE) == ARMS_OK);
+    assert(strcmp(scheduler_peek(&y.s), "BIG") == 0);
+
+    assert(ops_schedule_next(&y.s, &y.fs, &y.rs, fid, rid) == ARMS_OK);
+    assert(strcmp(fid, "SML") == 0 && strcmp(rid, "R1") == 0);
+
+    /* The blocked flight is still WAITING, still in the heap, still on top. */
+    assert(flight_find(&y.fs, "BIG")->state == STATE_WAITING);
+    assert(flight_find(&y.fs, "BIG")->runway_id[0] == '\0');
+    assert(scheduler_count(&y.s) == 1 && strcmp(scheduler_peek(&y.s), "BIG") == 0);
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+}
+
+static void test_ops_start_complete(void)
+{
+    Sys y;
+    char fid[ID_MAX_LEN + 1], rid[ID_MAX_LEN + 1];
+    sys_init(&y);
+
+    assert(runway_add(&y.rs, "R1", AIRCRAFT_LARGE) == ARMS_OK);
+    sys_flight(&y, "F1", FLIGHT_DEPARTURE, AIRCRAFT_MEDIUM);
+    sys_flight(&y, "F2", FLIGHT_DEPARTURE, AIRCRAFT_MEDIUM);
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK && strcmp(fid, "F1") == 0);
+
+    /* Wrong states and unknown flights. */
+    assert(ops_complete(&y.fs, &y.rs, "F1") == ARMS_ERR_INVALID_TRANSITION);
+    assert(ops_start(&y.fs, &y.rs, "F2") == ARMS_ERR_INVALID_TRANSITION);
+    assert(ops_start(&y.fs, &y.rs, "NOPE") == ARMS_ERR_NOT_FOUND);
+    assert(ops_start(&y.fs, &y.rs, NULL) == ARMS_ERR_INVALID_ARG);
+
+    assert(ops_start(&y.fs, &y.rs, "F1") == ARMS_OK);
+    assert(flight_find(&y.fs, "F1")->state == STATE_IN_OPERATION);
+    assert(runway_find(&y.rs, "R1")->status == RUNWAY_OCCUPIED);
+    assert(strcmp(flight_find(&y.fs, "F1")->runway_id, "R1") == 0);
+    assert(ops_start(&y.fs, &y.rs, "F1") == ARMS_ERR_INVALID_TRANSITION);
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+
+    /* R1 is still busy, so F2 cannot be scheduled yet. */
+    assert(sys_schedule(&y, fid, rid) == ARMS_ERR_NO_RUNWAY);
+
+    assert(ops_complete(&y.fs, &y.rs, "F1") == ARMS_OK);
+    assert(flight_find(&y.fs, "F1")->state == STATE_COMPLETED);
+    assert(flight_find(&y.fs, "F1")->runway_id[0] == '\0');
+    Runway *r = runway_find(&y.rs, "R1");
+    assert(r->status == RUNWAY_AVAILABLE && r->current_flight_id[0] == '\0');
+    assert(ops_complete(&y.fs, &y.rs, "F1") == ARMS_ERR_INVALID_TRANSITION);
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+
+    /* The released runway is reusable. */
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK && strcmp(fid, "F2") == 0);
+}
+
+static void test_ops_cancel(void)
+{
+    Sys y, before;
+    char fid[ID_MAX_LEN + 1], rid[ID_MAX_LEN + 1];
+    sys_init(&y);
+    assert(runway_add(&y.rs, "R1", AIRCRAFT_LARGE) == ARMS_OK);
+
+    /* REGISTERED */
+    assert(flight_add(&y.fs, "REG", FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(sys_cancel(&y, "REG") == ARMS_OK);
+    assert(flight_find(&y.fs, "REG")->state == STATE_CANCELLED);
+
+    /* WAITING in a normal queue */
+    sys_flight(&y, "WQ", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    assert(queue_contains(&y.rq.landing, "WQ"));
+    assert(sys_cancel(&y, "WQ") == ARMS_OK);
+    assert(!queue_contains(&y.rq.landing, "WQ"));
+    assert(flight_find(&y.fs, "WQ")->state == STATE_CANCELLED);
+
+    /* WAITING in the heap */
+    sys_flight(&y, "WH", FLIGHT_DEPARTURE, AIRCRAFT_SMALL);
+    sys_pull(&y);
+    assert(scheduler_contains(&y.s, "WH"));
+    assert(sys_cancel(&y, "WH") == ARMS_OK);
+    assert(!scheduler_contains(&y.s, "WH") && queue_is_empty(&y.rq.takeoff));
+    assert(flight_find(&y.fs, "WH")->state == STATE_CANCELLED);
+
+    /* HOLDING */
+    sys_flight(&y, "HLD", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    assert(holding_enter(&y.hq, &y.rq, &y.fs, "HLD") == ARMS_OK);
+    assert(holding_count(&y.hq) == 1);
+    assert(sys_cancel(&y, "HLD") == ARMS_OK);
+    assert(holding_count(&y.hq) == 0);
+    assert(flight_find(&y.fs, "HLD")->state == STATE_CANCELLED);
+
+    /* SCHEDULED: runway released */
+    sys_flight(&y, "SCH", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK && strcmp(fid, "SCH") == 0);
+    assert(sys_cancel(&y, "SCH") == ARMS_OK);
+    assert(flight_find(&y.fs, "SCH")->state == STATE_CANCELLED);
+    assert(flight_find(&y.fs, "SCH")->runway_id[0] == '\0');
+    Runway *r = runway_find(&y.rs, "R1");
+    assert(r->status == RUNWAY_AVAILABLE && r->current_flight_id[0] == '\0');
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+
+    /* IN_OPERATION: rejected, nothing changes; it can still complete. */
+    sys_flight(&y, "OP", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK);
+    assert(ops_start(&y.fs, &y.rs, "OP") == ARMS_OK);
+    snap_take(&y, &before);
+    assert(sys_cancel(&y, "OP") == ARMS_ERR_INVALID_TRANSITION);
+    assert(snap_same(&y, &before));
+    assert(ops_complete(&y.fs, &y.rs, "OP") == ARMS_OK);
+
+    /* Terminal states, unknown flight, bad arguments. */
+    assert(sys_cancel(&y, "OP") == ARMS_ERR_INVALID_TRANSITION);
+    assert(sys_cancel(&y, "REG") == ARMS_ERR_INVALID_TRANSITION);
+    assert(sys_cancel(&y, "NOPE") == ARMS_ERR_NOT_FOUND);
+    assert(sys_cancel(&y, NULL) == ARMS_ERR_INVALID_ARG);
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+}
+
+static void test_ops_atomic_failures(void)
+{
+    Sys y, before;
+    char fid[ID_MAX_LEN + 1], rid[ID_MAX_LEN + 1];
+    sys_init(&y);
+
+    assert(runway_add(&y.rs, "R1", AIRCRAFT_LARGE) == ARMS_OK);
+    assert(runway_add(&y.rs, "R2", AIRCRAFT_LARGE) == ARMS_OK);
+    sys_flight(&y, "OP", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK);
+    assert(ops_start(&y.fs, &y.rs, "OP") == ARMS_OK);
+    sys_flight(&y, "SC", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK);
+    sys_flight(&y, "HD", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    assert(holding_enter(&y.hq, &y.rq, &y.fs, "HD") == ARMS_OK);
+    sys_flight(&y, "WT", FLIGHT_DEPARTURE, AIRCRAFT_SMALL);   /* both runways busy */
+    sys_pull(&y);
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+
+    snap_take(&y, &before);
+    assert(ops_schedule_next(&y.s, &y.fs, &y.rs, fid, rid) == ARMS_ERR_NO_RUNWAY);
+    assert(ops_start(&y.fs, &y.rs, "OP") == ARMS_ERR_INVALID_TRANSITION);
+    assert(ops_start(&y.fs, &y.rs, "WT") == ARMS_ERR_INVALID_TRANSITION);
+    assert(ops_start(&y.fs, &y.rs, "NOPE") == ARMS_ERR_NOT_FOUND);
+    assert(ops_complete(&y.fs, &y.rs, "SC") == ARMS_ERR_INVALID_TRANSITION);
+    assert(ops_complete(&y.fs, &y.rs, "WT") == ARMS_ERR_INVALID_TRANSITION);
+    assert(ops_complete(&y.fs, &y.rs, "NOPE") == ARMS_ERR_NOT_FOUND);
+    assert(sys_cancel(&y, "OP") == ARMS_ERR_INVALID_TRANSITION);
+    assert(sys_cancel(&y, "NOPE") == ARMS_ERR_NOT_FOUND);
+    assert(snap_same(&y, &before));
+
+    /* Broken runway link: the call must refuse and leave everything as it was. */
+    Flight *sc = flight_find(&y.fs, "SC");
+    sc->runway_id[0] = '\0';
+    snap_take(&y, &before);
+    assert(ops_start(&y.fs, &y.rs, "SC") == ARMS_ERR_NOT_OCCUPIED);
+    assert(sys_cancel(&y, "SC") == ARMS_ERR_NOT_OCCUPIED);
+    assert(snap_same(&y, &before));
+    snprintf(sc->runway_id, sizeof sc->runway_id, "%s", "R2");
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+
+    Runway *r1 = runway_find(&y.rs, "R1");
+    r1->current_flight_id[0] = '\0';
+    snap_take(&y, &before);
+    assert(ops_complete(&y.fs, &y.rs, "OP") == ARMS_ERR_NOT_OCCUPIED);
+    assert(snap_same(&y, &before));
+    snprintf(r1->current_flight_id, sizeof r1->current_flight_id, "%s", "OP");
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+
+    /* A WAITING flight that is in no queue or heap cannot be cancelled cleanly. */
+    assert(flight_add(&y.fs, "LOST", FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(flight_transition(&y.fs, "LOST", STATE_WAITING) == ARMS_OK);
+    snap_take(&y, &before);
+    assert(sys_cancel(&y, "LOST") == ARMS_ERR_NOT_FOUND);
+    assert(snap_same(&y, &before));
+}
+
+static void test_ops_invariant_checker(void)
+{
+    Sys y;
+    char fid[ID_MAX_LEN + 1], rid[ID_MAX_LEN + 1];
+    sys_init(&y);
+
+    assert(runway_add(&y.rs, "R1", AIRCRAFT_LARGE) == ARMS_OK);
+    assert(runway_add(&y.rs, "R2", AIRCRAFT_LARGE) == ARMS_OK);
+    sys_flight(&y, "A", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    assert(sys_schedule(&y, fid, rid) == ARMS_OK);   /* A on R1 */
+    sys_flight(&y, "W", FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+    sys_pull(&y);                                      /* W waits in the heap */
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+    assert(!ops_check_invariants(NULL, &y.rs, &y.s));
+
+    Flight *a = flight_find(&y.fs, "A");
+    Flight *w = flight_find(&y.fs, "W");
+    Runway *r1 = runway_find(&y.rs, "R1");
+    Runway *r2 = runway_find(&y.rs, "R2");
+
+    a->runway_id[0] = '\0';                            /* active flight without a runway */
+    assert(!ops_check_invariants(&y.fs, &y.rs, &y.s));
+    snprintf(a->runway_id, sizeof a->runway_id, "%s", "R1");
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+
+    snprintf(a->runway_id, sizeof a->runway_id, "%s", "R2");   /* link points elsewhere */
+    assert(!ops_check_invariants(&y.fs, &y.rs, &y.s));
+    snprintf(a->runway_id, sizeof a->runway_id, "%s", "R1");
+
+    snprintf(w->runway_id, sizeof w->runway_id, "%s", "R1");   /* WAITING keeps a runway */
+    assert(!ops_check_invariants(&y.fs, &y.rs, &y.s));
+    w->runway_id[0] = '\0';
+
+    r2->status = RUNWAY_OCCUPIED;                      /* OCCUPIED with no flight */
+    assert(!ops_check_invariants(&y.fs, &y.rs, &y.s));
+    r2->status = RUNWAY_AVAILABLE;
+
+    snprintf(r2->current_flight_id, sizeof r2->current_flight_id, "%s", "A");   /* stale id */
+    assert(!ops_check_invariants(&y.fs, &y.rs, &y.s));
+    r2->current_flight_id[0] = '\0';
+
+    snprintf(r1->current_flight_id, sizeof r1->current_flight_id, "%s", "ZZ");  /* no such flight */
+    assert(!ops_check_invariants(&y.fs, &y.rs, &y.s));
+    snprintf(r1->current_flight_id, sizeof r1->current_flight_id, "%s", "A");
+
+    w->state = STATE_HOLDING;                          /* non-WAITING flight in the heap */
+    assert(!ops_check_invariants(&y.fs, &y.rs, &y.s));
+    w->state = STATE_WAITING;
+
+    /* Two flights claiming the same runway. */
+    add_flight_in_state(&y.fs, "B", STATE_SCHEDULED);
+    snprintf(flight_find(&y.fs, "B")->runway_id, ID_MAX_LEN + 1, "%s", "R1");
+    assert(!ops_check_invariants(&y.fs, &y.rs, &y.s));
+    flight_find(&y.fs, "B")->runway_id[0] = '\0';
+    flight_find(&y.fs, "B")->state = STATE_CANCELLED;
+    assert(ops_check_invariants(&y.fs, &y.rs, &y.s));
+}
+
 int main(void)
 {
     test_ids_and_common();
@@ -1311,6 +1696,15 @@ int main(void)
     test_scheduler_priority_update();
     test_scheduler_hold();
     test_scheduler_hold_full_holding();
+    test_ops_schedule_basic();
+    test_ops_priority_order();
+    test_ops_runway_selection();
+    test_ops_runway_unavailable();
+    test_ops_blocked_top_skipped();
+    test_ops_start_complete();
+    test_ops_cancel();
+    test_ops_atomic_failures();
+    test_ops_invariant_checker();
 
     printf("All core tests passed.\n");
     return 0;
