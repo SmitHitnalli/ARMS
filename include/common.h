@@ -20,7 +20,8 @@ typedef enum {
     ARMS_ERR_RUNWAY_CLOSED,
     ARMS_ERR_NOT_OCCUPIED,
     ARMS_ERR_NOT_ELIGIBLE,       /* flight is not WAITING or HOLDING */
-    ARMS_ERR_INCOMPATIBLE
+    ARMS_ERR_INCOMPATIBLE,
+    ARMS_ERR_EMPTY
 } ArmsStatus;
 
 /* Returns 1 if id is 1-15 characters of A-Z, 0-9 or '-', else 0. */

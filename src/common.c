@@ -30,6 +30,7 @@ const char *arms_status_str(ArmsStatus s)
     case ARMS_ERR_NOT_OCCUPIED:      return "Runway is not occupied";
     case ARMS_ERR_NOT_ELIGIBLE:      return "Flight is not waiting or holding";
     case ARMS_ERR_INCOMPATIBLE:      return "Runway cannot handle this aircraft category";
+    case ARMS_ERR_EMPTY:             return "Queue is empty";
     }
     return "Unknown status";
 }

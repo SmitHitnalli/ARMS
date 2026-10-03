@@ -6,6 +6,8 @@
 #include "common.h"
 #include "flight.h"
 #include "runway.h"
+#include "queue.h"
+#include "request.h"
 
 /* Independent copy of the approved transition table, to check flight.c against. */
 static const int expected[STATE_COUNT][STATE_COUNT] = {
@@ -353,6 +355,252 @@ static void test_printing(void)
     remove(SCRATCH_FILE);
 }
 
+/* Enqueues "<prefix><n>" for n in [from, to). */
+static void fill_queue(Queue *q, const char *prefix, int from, int to)
+{
+    char id[ID_MAX_LEN + 1];
+    for (int n = from; n < to; n++) {
+        snprintf(id, sizeof id, "%s%d", prefix, n);
+        assert(queue_enqueue(q, id) == ARMS_OK);
+    }
+}
+
+static void test_queue_basic(void)
+{
+    Queue q;
+    char out[ID_MAX_LEN + 1] = "keep";
+
+    queue_init(&q);
+    assert(queue_is_empty(&q) && !queue_is_full(&q) && queue_count(&q) == 0);
+    assert(queue_front(&q) == NULL && queue_at(&q, 0) == NULL);
+    assert(q.front == 0 && q.rear == 0);
+
+    /* Empty queue: dequeue fails and leaves the output buffer alone. */
+    assert(queue_dequeue(&q, out) == ARMS_ERR_EMPTY);
+    assert(strcmp(out, "keep") == 0);
+
+    /* FIFO order. */
+    assert(queue_enqueue(&q, "A-1") == ARMS_OK);
+    assert(queue_enqueue(&q, "B-2") == ARMS_OK);
+    assert(queue_enqueue(&q, "C-3") == ARMS_OK);
+    assert(queue_count(&q) == 3 && q.rear == 3);
+    assert(strcmp(queue_front(&q), "A-1") == 0);
+    assert(queue_front(&q) == queue_at(&q, 0));
+    assert(strcmp(queue_at(&q, 2), "C-3") == 0);
+    assert(queue_at(&q, 3) == NULL && queue_at(&q, -1) == NULL);
+    assert(queue_contains(&q, "B-2") && !queue_contains(&q, "Z-9"));
+
+    /* Partial dequeue: front advances, indexing starts at the new front. */
+    assert(queue_dequeue(&q, out) == ARMS_OK && strcmp(out, "A-1") == 0);
+    assert(q.front == 1 && q.rear == 3 && queue_count(&q) == 2);
+    assert(strcmp(queue_at(&q, 0), "B-2") == 0);
+    assert(!queue_contains(&q, "A-1"));
+
+    /* Draining resets front and rear. */
+    assert(queue_dequeue(&q, out) == ARMS_OK && strcmp(out, "B-2") == 0);
+    assert(queue_dequeue(&q, out) == ARMS_OK && strcmp(out, "C-3") == 0);
+    assert(queue_is_empty(&q) && q.front == 0 && q.rear == 0);
+    assert(queue_enqueue(&q, "D-4") == ARMS_OK);
+    assert(q.front == 0 && q.rear == 1 && strcmp(queue_front(&q), "D-4") == 0);
+
+    /* Invalid IDs are rejected without changing the queue. */
+    assert(queue_enqueue(&q, "bad id") == ARMS_ERR_INVALID_ID);
+    assert(queue_enqueue(&q, "") == ARMS_ERR_INVALID_ID);
+    assert(queue_enqueue(&q, "ABCDEFGHIJKLMNOP") == ARMS_ERR_INVALID_ID);   /* 16 chars */
+    assert(queue_count(&q) == 1);
+
+    /* NULL arguments. */
+    assert(queue_enqueue(NULL, "A-1") == ARMS_ERR_INVALID_ARG);
+    assert(queue_enqueue(&q, NULL) == ARMS_ERR_INVALID_ARG);
+    assert(queue_dequeue(NULL, out) == ARMS_ERR_INVALID_ARG);
+    assert(queue_dequeue(&q, NULL) == ARMS_ERR_INVALID_ARG);
+    assert(queue_front(NULL) == NULL && queue_at(NULL, 0) == NULL);
+    assert(queue_is_empty(NULL) && !queue_is_full(NULL) && queue_count(NULL) == 0);
+    assert(!queue_contains(NULL, "A-1") && !queue_contains(&q, NULL));
+    queue_init(NULL);
+    queue_print(NULL, &q);
+    queue_print(stdout, NULL);
+    assert(queue_count(&q) == 1);
+}
+
+static void test_queue_full_and_compaction(void)
+{
+    Queue q;
+    char out[ID_MAX_LEN + 1];
+
+    queue_init(&q);
+    fill_queue(&q, "Q-", 0, QUEUE_CAPACITY);
+    assert(queue_is_full(&q) && q.rear == QUEUE_CAPACITY);
+
+    /* Truly full: front is 0, so there is nothing to reclaim. */
+    assert(queue_enqueue(&q, "X-1") == ARMS_ERR_FULL);
+    assert(queue_count(&q) == QUEUE_CAPACITY && !queue_contains(&q, "X-1"));
+
+    /* Free 3 slots at the front. rear is still at the end, but the space is reusable. */
+    for (int i = 0; i < 3; i++)
+        assert(queue_dequeue(&q, out) == ARMS_OK);
+    assert(q.front == 3 && q.rear == QUEUE_CAPACITY && !queue_is_full(&q));
+
+    /* Enqueue compacts: front/rear reset and FIFO order is preserved. */
+    assert(queue_enqueue(&q, "NEW-1") == ARMS_OK);
+    assert(q.front == 0 && q.rear == QUEUE_CAPACITY - 2 && queue_count(&q) == QUEUE_CAPACITY - 2);
+    assert(strcmp(queue_front(&q), "Q-3") == 0);
+    assert(strcmp(queue_at(&q, 1), "Q-4") == 0);
+    assert(strcmp(queue_at(&q, QUEUE_CAPACITY - 4), "Q-99") == 0);
+    assert(strcmp(queue_at(&q, QUEUE_CAPACITY - 3), "NEW-1") == 0);
+
+    /* The other two freed slots are usable too, then the queue is full again. */
+    assert(queue_enqueue(&q, "NEW-2") == ARMS_OK);
+    assert(queue_enqueue(&q, "NEW-3") == ARMS_OK);
+    assert(queue_is_full(&q));
+    assert(queue_enqueue(&q, "NEW-4") == ARMS_ERR_FULL);
+
+    /* Full drain returns every ID in original FIFO order. */
+    for (int n = 3; n < QUEUE_CAPACITY; n++) {
+        char want[ID_MAX_LEN + 1];
+        snprintf(want, sizeof want, "Q-%d", n);
+        assert(queue_dequeue(&q, out) == ARMS_OK && strcmp(out, want) == 0);
+    }
+    assert(queue_dequeue(&q, out) == ARMS_OK && strcmp(out, "NEW-1") == 0);
+    assert(queue_dequeue(&q, out) == ARMS_OK && strcmp(out, "NEW-2") == 0);
+    assert(queue_dequeue(&q, out) == ARMS_OK && strcmp(out, "NEW-3") == 0);
+    assert(queue_is_empty(&q) && q.front == 0 && q.rear == 0);
+}
+
+static void test_queue_print(void)
+{
+    Queue q;
+    char buf[256];
+    FILE *f = fopen(SCRATCH_FILE, "w+");
+    assert(f != NULL);
+
+    queue_init(&q);
+    queue_print(f, &q);
+    read_back(f, buf, sizeof buf);
+    assert(strstr(buf, "(queue empty)") != NULL);
+
+    fclose(f);
+    f = fopen(SCRATCH_FILE, "w+");
+    assert(f != NULL);
+    assert(queue_enqueue(&q, "AI-1") == ARMS_OK);
+    assert(queue_enqueue(&q, "AI-2") == ARMS_OK);
+    queue_print(f, &q);
+    read_back(f, buf, sizeof buf);
+    assert(strstr(buf, "1. AI-1") != NULL && strstr(buf, "2. AI-2") != NULL);
+
+    fclose(f);
+    remove(SCRATCH_FILE);
+}
+
+/* Snapshot of a queue's bookkeeping, to prove a failed call changed nothing. */
+static int same_queue_state(const Queue *a, const Queue *b)
+{
+    return a->front == b->front && a->rear == b->rear && a->count == b->count;
+}
+
+static void test_request_submit(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    char out[ID_MAX_LEN + 1];
+
+    flight_store_init(&fs);
+    request_init(&rq);
+    assert(flight_add(&fs, "ARR-1", FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(flight_add(&fs, "ARR-2", FLIGHT_ARRIVAL, AIRCRAFT_LARGE) == ARMS_OK);
+    assert(flight_add(&fs, "DEP-1", FLIGHT_DEPARTURE, AIRCRAFT_MEDIUM) == ARMS_OK);
+
+    /* Routing by type, with REGISTERED -> WAITING. */
+    assert(request_submit(&rq, &fs, "ARR-1") == ARMS_OK);
+    assert(queue_count(&rq.landing) == 1 && queue_count(&rq.takeoff) == 0);
+    assert(flight_find(&fs, "ARR-1")->state == STATE_WAITING);
+    assert(request_submit(&rq, &fs, "DEP-1") == ARMS_OK);
+    assert(queue_count(&rq.landing) == 1 && queue_count(&rq.takeoff) == 1);
+    assert(strcmp(queue_front(&rq.takeoff), "DEP-1") == 0);
+    assert(flight_find(&fs, "DEP-1")->state == STATE_WAITING);
+
+    /* FIFO across submissions. */
+    assert(request_submit(&rq, &fs, "ARR-2") == ARMS_OK);
+    assert(strcmp(queue_at(&rq.landing, 0), "ARR-1") == 0);
+    assert(strcmp(queue_at(&rq.landing, 1), "ARR-2") == 0);
+
+    /* Reference behaviour: the queue holds a copy of the ID, resolved via the store. */
+    Flight *f = flight_find(&fs, "ARR-1");
+    assert(queue_front(&rq.landing) != f->id);
+    assert(strcmp(queue_front(&rq.landing), f->id) == 0);
+    assert(flight_transition(&fs, "ARR-1", STATE_HOLDING) == ARMS_OK);
+    assert(flight_find(&fs, queue_front(&rq.landing)) == f && f->state == STATE_HOLDING);
+    assert(queue_dequeue(&rq.landing, out) == ARMS_OK && strcmp(out, "ARR-1") == 0);
+    assert(flight_find(&fs, out) == f);
+
+    /* Duplicate: a second submit changes nothing. */
+    RequestQueues before = rq;
+    assert(request_submit(&rq, &fs, "DEP-1") == ARMS_ERR_DUPLICATE);
+    assert(same_queue_state(&rq.takeoff, &before.takeoff));
+    assert(same_queue_state(&rq.landing, &before.landing));
+    assert(flight_find(&fs, "DEP-1")->state == STATE_WAITING);
+
+    /* Unknown flight and NULL arguments. */
+    before = rq;
+    assert(request_submit(&rq, &fs, "NOPE") == ARMS_ERR_NOT_FOUND);
+    assert(request_submit(NULL, &fs, "ARR-1") == ARMS_ERR_INVALID_ARG);
+    assert(request_submit(&rq, NULL, "ARR-1") == ARMS_ERR_INVALID_ARG);
+    assert(request_submit(&rq, &fs, NULL) == ARMS_ERR_INVALID_ARG);
+    assert(same_queue_state(&rq.landing, &before.landing));
+    assert(same_queue_state(&rq.takeoff, &before.takeoff));
+    request_init(NULL);
+}
+
+static void test_request_rejects_non_registered(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    char id[ID_MAX_LEN + 1];
+
+    flight_store_init(&fs);
+    request_init(&rq);
+
+    /* One flight per non-REGISTERED state (HOLDING included: HOLDING -> WAITING is not a request). */
+    for (int s = STATE_WAITING; s < STATE_COUNT; s++) {
+        snprintf(id, sizeof id, "ST-%d", s);
+        add_flight_in_state(&fs, id, (FlightState)s);
+        assert(request_submit(&rq, &fs, id) == ARMS_ERR_INVALID_TRANSITION);
+        assert(flight_find(&fs, id)->state == (FlightState)s);
+    }
+    assert(queue_is_empty(&rq.landing) && queue_is_empty(&rq.takeoff));
+    assert(rq.landing.rear == 0 && rq.takeoff.rear == 0);
+}
+
+static void test_request_full_queue(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+
+    flight_store_init(&fs);
+    request_init(&rq);
+    fill_queue(&rq.landing, "Q-", 0, QUEUE_CAPACITY);
+    assert(flight_add(&fs, "ARR-1", FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(flight_add(&fs, "DEP-1", FLIGHT_DEPARTURE, AIRCRAFT_SMALL) == ARMS_OK);
+
+    /* Full landing queue: the flight stays REGISTERED and nothing is queued. */
+    RequestQueues before = rq;
+    assert(request_submit(&rq, &fs, "ARR-1") == ARMS_ERR_FULL);
+    assert(flight_find(&fs, "ARR-1")->state == STATE_REGISTERED);
+    assert(same_queue_state(&rq.landing, &before.landing));
+    assert(!queue_contains(&rq.landing, "ARR-1"));
+
+    /* The takeoff queue is independent and still accepts requests. */
+    assert(request_submit(&rq, &fs, "DEP-1") == ARMS_OK);
+    assert(flight_find(&fs, "DEP-1")->state == STATE_WAITING);
+
+    /* Once a landing slot frees up (via compaction), the arrival can be queued. */
+    char out[ID_MAX_LEN + 1];
+    assert(queue_dequeue(&rq.landing, out) == ARMS_OK);
+    assert(request_submit(&rq, &fs, "ARR-1") == ARMS_OK);
+    assert(strcmp(queue_at(&rq.landing, QUEUE_CAPACITY - 1), "ARR-1") == 0);
+    assert(flight_find(&fs, "ARR-1")->state == STATE_WAITING);
+}
+
 int main(void)
 {
     test_ids_and_common();
@@ -362,6 +610,12 @@ int main(void)
     test_runway_add_find_status();
     test_runway_assign_release();
     test_printing();
+    test_queue_basic();
+    test_queue_full_and_compaction();
+    test_queue_print();
+    test_request_submit();
+    test_request_rejects_non_registered();
+    test_request_full_queue();
 
     printf("All core tests passed.\n");
     return 0;
