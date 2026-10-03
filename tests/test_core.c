@@ -14,6 +14,7 @@
 #include "scheduler.h"
 #include "operations.h"
 #include "history.h"
+#include "reports.h"
 
 /* Test-only hook defined in history.c when built with -DARMS_TESTING. */
 extern int history_fail_next_alloc;
@@ -1827,6 +1828,254 @@ static void test_history_alloc_failure_in_completion(void)
     history_clear(&y.hist);
 }
 
+/* ---- Phase 8: reports (sorting and binary search) ---- */
+
+/* "A,B,C" style summary of a sorted pointer array. */
+static void flight_order(const Flight **a, int n, char *buf)
+{
+    buf[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        if (i > 0) strcat(buf, ",");
+        strcat(buf, a[i]->id);
+    }
+}
+
+static void move_order(const Movement **a, int n, char *buf)
+{
+    buf[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        if (i > 0) strcat(buf, ",");
+        strcat(buf, a[i]->flight_id);
+    }
+}
+
+/* Registers the given IDs in order. */
+static void store_with(FlightStore *fs, const char *const *ids, int n)
+{
+    flight_store_init(fs);
+    for (int i = 0; i < n; i++)
+        assert(flight_add(fs, ids[i], FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+}
+
+/* Sorts, checks the order string, and checks the call succeeded. */
+static void check_flights(const FlightStore *fs, FlightSortKey key, int asc, const char *want)
+{
+    const Flight *out[MAX_FLIGHTS];
+    char buf[256];
+    int n = -1;
+    assert(report_flights_sorted(fs, key, asc, out, MAX_FLIGHTS, &n) == ARMS_OK);
+    flight_order(out, n, buf);
+    assert(strcmp(buf, want) == 0);
+}
+
+static void check_history(const MovementHistory *h, HistorySortKey key, int asc, const char *want)
+{
+    const Movement *out[16];
+    char buf[256];
+    int n = -1;
+    assert(report_history_sorted(h, key, asc, out, 16, &n) == ARMS_OK);
+    move_order(out, n, buf);
+    assert(strcmp(buf, want) == 0);
+}
+
+static void test_reports_flights_by_id(void)
+{
+    FlightStore fs;
+    const Flight *out[MAX_FLIGHTS];
+    int n = -1;
+
+    /* empty (also with cap 0) */
+    flight_store_init(&fs);
+    assert(report_flights_sorted(&fs, FLIGHT_SORT_ID, 1, out, MAX_FLIGHTS, &n) == ARMS_OK && n == 0);
+    assert(report_flights_sorted(&fs, FLIGHT_SORT_ID, 1, out, 0, &n) == ARMS_OK && n == 0);
+
+    /* single item */
+    const char *one[] = { "A" };
+    store_with(&fs, one, 1);
+    check_flights(&fs, FLIGHT_SORT_ID, 1, "A");
+    check_flights(&fs, FLIGHT_SORT_ID, 0, "A");
+
+    /* already sorted */
+    const char *sorted[] = { "A", "B", "C" };
+    store_with(&fs, sorted, 3);
+    check_flights(&fs, FLIGHT_SORT_ID, 1, "A,B,C");
+    check_flights(&fs, FLIGHT_SORT_ID, 0, "C,B,A");
+
+    /* reverse order and mixed order */
+    const char *rev[] = { "C", "B", "A" };
+    store_with(&fs, rev, 3);
+    check_flights(&fs, FLIGHT_SORT_ID, 1, "A,B,C");
+    check_flights(&fs, FLIGHT_SORT_ID, 0, "C,B,A");
+    const char *mixed[] = { "F2", "F10", "A-1", "F1" };
+    store_with(&fs, mixed, 4);
+    check_flights(&fs, FLIGHT_SORT_ID, 1, "A-1,F1,F10,F2");   /* plain strcmp order */
+    check_flights(&fs, FLIGHT_SORT_ID, 0, "F2,F10,F1,A-1");
+
+    /* source store is not reordered */
+    FlightStore before = fs;
+    assert(report_flights_sorted(&fs, FLIGHT_SORT_ID, 1, out, MAX_FLIGHTS, &n) == ARMS_OK);
+    assert(memcmp(&fs, &before, sizeof fs) == 0);
+    assert(strcmp(flight_at(&fs, 0)->id, "F2") == 0 && strcmp(flight_at(&fs, 3)->id, "F1") == 0);
+    assert(out[0] == flight_find(&fs, "A-1"));   /* pointers refer to the real flights */
+}
+
+static void test_reports_flights_by_request_and_priority(void)
+{
+    FlightStore fs;
+    const char *ids[] = { "X", "Y", "Z" };
+    store_with(&fs, ids, 3);
+
+    /* request_tick first, then request_seq */
+    flight_find(&fs, "X")->request_tick = 5; flight_find(&fs, "X")->request_seq = 1;
+    flight_find(&fs, "Y")->request_tick = 2; flight_find(&fs, "Y")->request_seq = 3;
+    flight_find(&fs, "Z")->request_tick = 2; flight_find(&fs, "Z")->request_seq = 2;
+    check_flights(&fs, FLIGHT_SORT_REQUEST, 1, "Z,Y,X");
+    check_flights(&fs, FLIGHT_SORT_REQUEST, 0, "X,Y,Z");
+
+    /* fully equal keys keep store order in BOTH directions (stability) */
+    const char *ties[] = { "P", "Q", "R" };
+    store_with(&fs, ties, 3);
+    flight_find(&fs, "P")->request_tick = 1; flight_find(&fs, "P")->request_seq = 1;
+    flight_find(&fs, "Q")->request_tick = 1; flight_find(&fs, "Q")->request_seq = 1;
+    flight_find(&fs, "R")->request_tick = 0; flight_find(&fs, "R")->request_seq = 1;
+    check_flights(&fs, FLIGHT_SORT_REQUEST, 1, "R,P,Q");
+    check_flights(&fs, FLIGHT_SORT_REQUEST, 0, "P,Q,R");   /* not the reverse of ascending */
+
+    /* priority: emergency, then ARRIVAL before DEPARTURE, then request_seq */
+    FlightStore ps;
+    flight_store_init(&ps);
+    assert(flight_add(&ps, "DEP", FLIGHT_DEPARTURE, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(flight_add(&ps, "ARR", FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(flight_add(&ps, "EMG", FLIGHT_DEPARTURE, AIRCRAFT_SMALL) == ARMS_OK);
+    flight_find(&ps, "DEP")->request_seq = 1;
+    flight_find(&ps, "ARR")->request_seq = 2;
+    flight_find(&ps, "EMG")->request_seq = 3;
+    flight_find(&ps, "EMG")->emergency = EMERGENCY_ACTIVE;
+    check_flights(&ps, FLIGHT_SORT_PRIORITY, 1, "EMG,ARR,DEP");   /* most urgent first */
+    check_flights(&ps, FLIGHT_SORT_PRIORITY, 0, "DEP,ARR,EMG");
+
+    /* priority agrees with the scheduler's comparator */
+    const Flight *out[MAX_FLIGHTS];
+    int n;
+    assert(report_flights_sorted(&ps, FLIGHT_SORT_PRIORITY, 1, out, MAX_FLIGHTS, &n) == ARMS_OK);
+    for (int i = 0; i + 1 < n; i++)
+        assert(flight_priority_higher(out[i], out[i + 1]));
+    assert(strcmp(flight_at(&ps, 0)->id, "DEP") == 0);   /* store order unchanged */
+}
+
+static void test_reports_flight_errors_and_capacity(void)
+{
+    FlightStore fs;
+    const char *ids[] = { "A", "B", "C" };
+    store_with(&fs, ids, 3);
+    const Flight *out[3];
+    int n = 99;
+
+    assert(report_flights_sorted(&fs, FLIGHT_SORT_ID, 1, out, 2, &n) == ARMS_ERR_FULL && n == 0);
+    assert(report_flights_sorted(&fs, FLIGHT_SORT_ID, 1, out, 3, &n) == ARMS_OK && n == 3);
+
+    assert(report_flights_sorted(NULL, FLIGHT_SORT_ID, 1, out, 3, &n) == ARMS_ERR_INVALID_ARG);
+    assert(report_flights_sorted(&fs, FLIGHT_SORT_ID, 1, NULL, 3, &n) == ARMS_ERR_INVALID_ARG);
+    assert(report_flights_sorted(&fs, FLIGHT_SORT_ID, 1, out, 3, NULL) == ARMS_ERR_INVALID_ARG);
+    assert(report_flights_sorted(&fs, FLIGHT_SORT_ID, 1, out, -1, &n) == ARMS_ERR_INVALID_ARG);
+    assert(report_flights_sorted(&fs, (FlightSortKey)99, 1, out, 3, &n) == ARMS_ERR_INVALID_ARG);
+}
+
+static void test_reports_history(void)
+{
+    MovementHistory h;
+    const Movement *out[16];
+    int n = -1;
+    history_init(&h);
+
+    /* empty and single */
+    assert(report_history_sorted(&h, HIST_SORT_FLIGHT_ID, 1, out, 16, &n) == ARMS_OK && n == 0);
+    assert(report_history_sorted(&h, HIST_SORT_COMPLETION, 1, out, 0, &n) == ARMS_OK && n == 0);
+    Movement a = make_movement("C", "R1"); a.completed_tick = 5;
+    Movement b = make_movement("A", "R1"); b.completed_tick = 5;
+    Movement c = make_movement("B", "R2"); c.completed_tick = 2;
+    assert(history_append(&h, &a) == ARMS_OK);
+    check_history(&h, HIST_SORT_FLIGHT_ID, 1, "C");
+    check_history(&h, HIST_SORT_COMPLETION, 0, "C");
+
+    /* list order is C, A, B; completion ticks 5, 5, 2 */
+    assert(history_append(&h, &b) == ARMS_OK);
+    assert(history_append(&h, &c) == ARMS_OK);
+    check_history(&h, HIST_SORT_FLIGHT_ID, 1, "A,B,C");
+    check_history(&h, HIST_SORT_FLIGHT_ID, 0, "C,B,A");
+    check_history(&h, HIST_SORT_COMPLETION, 1, "B,C,A");   /* tie (C, A) keeps list order */
+    check_history(&h, HIST_SORT_COMPLETION, 0, "C,A,B");   /* tie keeps list order; not "A,C,B" */
+
+    /* source list is unchanged, and the pointers refer to its nodes */
+    assert(report_history_sorted(&h, HIST_SORT_FLIGHT_ID, 1, out, 16, &n) == ARMS_OK && n == 3);
+    assert(history_count(&h) == 3);
+    assert(strcmp(history_at(&h, 0)->flight_id, "C") == 0);
+    assert(strcmp(history_at(&h, 1)->flight_id, "A") == 0);
+    assert(strcmp(history_at(&h, 2)->flight_id, "B") == 0);
+    assert(out[0] == history_find(&h, "A") && out[2] == history_find(&h, "C"));
+    assert(h.head->data.flight_id[0] == 'C' && h.tail->data.flight_id[0] == 'B' && h.tail->next == NULL);
+
+    /* capacity and bad arguments */
+    assert(report_history_sorted(&h, HIST_SORT_FLIGHT_ID, 1, out, 2, &n) == ARMS_ERR_FULL && n == 0);
+    assert(report_history_sorted(NULL, HIST_SORT_FLIGHT_ID, 1, out, 16, &n) == ARMS_ERR_INVALID_ARG);
+    assert(report_history_sorted(&h, HIST_SORT_FLIGHT_ID, 1, NULL, 16, &n) == ARMS_ERR_INVALID_ARG);
+    assert(report_history_sorted(&h, (HistorySortKey)99, 1, out, 16, &n) == ARMS_ERR_INVALID_ARG);
+    history_clear(&h);
+
+    /* already sorted and reverse completion order */
+    Movement m1 = make_movement("M1", "R1"); m1.completed_tick = 1;
+    Movement m2 = make_movement("M2", "R1"); m2.completed_tick = 2;
+    Movement m3 = make_movement("M3", "R1"); m3.completed_tick = 3;
+    assert(history_append(&h, &m1) == ARMS_OK && history_append(&h, &m2) == ARMS_OK
+           && history_append(&h, &m3) == ARMS_OK);
+    check_history(&h, HIST_SORT_COMPLETION, 1, "M1,M2,M3");
+    check_history(&h, HIST_SORT_COMPLETION, 0, "M3,M2,M1");
+    history_clear(&h);
+    assert(history_append(&h, &m3) == ARMS_OK && history_append(&h, &m2) == ARMS_OK
+           && history_append(&h, &m1) == ARMS_OK);
+    check_history(&h, HIST_SORT_COMPLETION, 1, "M1,M2,M3");
+    check_history(&h, HIST_SORT_COMPLETION, 0, "M3,M2,M1");
+    history_clear(&h);
+}
+
+static void test_reports_searches(void)
+{
+    FlightStore fs;
+    const char *ids[] = { "D", "B", "G", "A", "F", "C", "E" };
+    store_with(&fs, ids, 7);
+    const Flight *sorted[MAX_FLIGHTS];
+    int n;
+    assert(report_flights_sorted(&fs, FLIGHT_SORT_ID, 1, sorted, MAX_FLIGHTS, &n) == ARMS_OK && n == 7);
+
+    /* binary search: first, middle, last, between, below, above */
+    assert(report_find_flight_sorted(sorted, n, "A") == flight_find(&fs, "A"));
+    assert(report_find_flight_sorted(sorted, n, "D") == flight_find(&fs, "D"));
+    assert(report_find_flight_sorted(sorted, n, "G") == flight_find(&fs, "G"));
+    assert(report_find_flight_sorted(sorted, n, "B") == flight_find(&fs, "B"));
+    assert(report_find_flight_sorted(sorted, n, "DD") == NULL);
+    assert(report_find_flight_sorted(sorted, n, "0") == NULL);
+    assert(report_find_flight_sorted(sorted, n, "H") == NULL);
+    assert(report_find_flight_sorted(sorted, 0, "A") == NULL);
+    assert(report_find_flight_sorted(sorted, 1, "A") == sorted[0]);
+    assert(report_find_flight_sorted(sorted, 1, "B") == NULL);
+    assert(report_find_flight_sorted(NULL, 7, "A") == NULL);
+    assert(report_find_flight_sorted(sorted, n, NULL) == NULL);
+
+    /* existing linear searches: hit and miss */
+    assert(flight_find(&fs, "E") != NULL && strcmp(flight_find(&fs, "E")->id, "E") == 0);
+    assert(flight_find(&fs, "ZZ") == NULL);
+    RunwayStore rs;
+    runway_store_init(&rs);
+    assert(runway_add(&rs, "R1", AIRCRAFT_LARGE) == ARMS_OK);
+    assert(runway_find(&rs, "R1") != NULL && runway_find(&rs, "R9") == NULL);
+    MovementHistory h;
+    history_init(&h);
+    Movement m = make_movement("F1", "R1");
+    assert(history_append(&h, &m) == ARMS_OK);
+    assert(history_find(&h, "F1") != NULL && history_find(&h, "F9") == NULL);
+    history_clear(&h);
+}
+
 int main(void)
 {
     test_ids_and_common();
@@ -1872,6 +2121,11 @@ int main(void)
     test_history_list_basic();
     test_history_from_completion();
     test_history_alloc_failure_in_completion();
+    test_reports_flights_by_id();
+    test_reports_flights_by_request_and_priority();
+    test_reports_flight_errors_and_capacity();
+    test_reports_history();
+    test_reports_searches();
 
     printf("All core tests passed.\n");
     return 0;
