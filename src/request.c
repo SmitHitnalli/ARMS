@@ -37,5 +37,8 @@ ArmsStatus request_submit(RequestQueues *rq, FlightStore *fs, const char *id)
     ArmsStatus s = queue_enqueue(target, id);
     if (s != ARMS_OK)
         return s;
+    /* Stamp the request once; holding never changes these, so a flight keeps its age. */
+    f->request_tick = fs->now;
+    f->request_seq = fs->next_seq++;
     return flight_transition(fs, id, STATE_WAITING);
 }

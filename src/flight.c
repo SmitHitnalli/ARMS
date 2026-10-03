@@ -22,8 +22,11 @@ static int state_in_range(FlightState s)
 
 void flight_store_init(FlightStore *fs)
 {
-    if (fs != NULL)
+    if (fs != NULL) {
         fs->count = 0;
+        fs->now = 0;
+        fs->next_seq = 0;
+    }
 }
 
 ArmsStatus flight_add(FlightStore *fs, const char *id, FlightType type,
@@ -47,6 +50,10 @@ ArmsStatus flight_add(FlightStore *fs, const char *id, FlightType type,
     f->type = type;
     f->category = category;
     f->state = STATE_REGISTERED;
+    f->emergency = EMERGENCY_NONE;
+    f->fuel = FUEL_NORMAL;
+    f->request_tick = 0;
+    f->request_seq = 0;
     fs->count++;
     return ARMS_OK;
 }
@@ -83,6 +90,62 @@ ArmsStatus flight_transition(FlightStore *fs, const char *id, FlightState to)
 
     f->state = to;
     return ARMS_OK;
+}
+
+/* Shared checks for the two setters: returns the flight, or NULL with *err set. */
+static Flight *editable_flight(FlightStore *fs, const char *id, ArmsStatus *err)
+{
+    if (fs == NULL || id == NULL) {
+        *err = ARMS_ERR_INVALID_ARG;
+        return NULL;
+    }
+    Flight *f = flight_find(fs, id);
+    if (f == NULL)
+        *err = ARMS_ERR_NOT_FOUND;
+    else if (f->state == STATE_COMPLETED || f->state == STATE_CANCELLED) {
+        *err = ARMS_ERR_NOT_ELIGIBLE;
+        f = NULL;
+    }
+    return f;
+}
+
+ArmsStatus flight_set_emergency(FlightStore *fs, const char *id, EmergencyLevel level)
+{
+    ArmsStatus err = ARMS_OK;
+    if ((int)level < EMERGENCY_NONE || (int)level > EMERGENCY_ACTIVE)
+        return ARMS_ERR_INVALID_ARG;
+    Flight *f = editable_flight(fs, id, &err);
+    if (f == NULL)
+        return err;
+    f->emergency = level;
+    return ARMS_OK;
+}
+
+ArmsStatus flight_set_fuel(FlightStore *fs, const char *id, FuelLevel level)
+{
+    ArmsStatus err = ARMS_OK;
+    if ((int)level < FUEL_NORMAL || (int)level > FUEL_CRITICAL)
+        return ARMS_ERR_INVALID_ARG;
+    Flight *f = editable_flight(fs, id, &err);
+    if (f == NULL)
+        return err;
+    f->fuel = level;
+    return ARMS_OK;
+}
+
+int flight_priority_higher(const Flight *a, const Flight *b)
+{
+    if (a == NULL || b == NULL)
+        return 0;
+    if (a->emergency != b->emergency)
+        return a->emergency > b->emergency;
+    if (a->fuel != b->fuel)
+        return a->fuel > b->fuel;
+    if (a->type != b->type)
+        return a->type == FLIGHT_ARRIVAL;
+    if (a->request_tick != b->request_tick)
+        return a->request_tick < b->request_tick;
+    return a->request_seq < b->request_seq;
 }
 
 int flight_count(const FlightStore *fs)

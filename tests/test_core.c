@@ -10,6 +10,8 @@
 #include "request.h"
 #include "cqueue.h"
 #include "holding.h"
+#include "heap.h"
+#include "scheduler.h"
 
 /* Independent copy of the approved transition table, to check flight.c against. */
 static const int expected[STATE_COUNT][STATE_COUNT] = {
@@ -873,6 +875,409 @@ static void test_holding_leave_failures(void)
     assert(cqueue_contains(&h.queue, "DEP-1") && queue_count(&rq.takeoff) == 1);
 }
 
+/* ---------- Phase 5: max heap + scheduler ---------- */
+
+/* Pops the whole scheduler and returns the IDs joined by spaces. */
+static void drain_order(Scheduler *s, FlightStore *fs, char *out, size_t size)
+{
+    char id[ID_MAX_LEN + 1];
+    out[0] = '\0';
+    while (scheduler_pop(s, fs, id) == ARMS_OK) {
+        strncat(out, id, size - strlen(out) - 1);
+        strncat(out, " ", size - strlen(out) - 1);
+    }
+}
+
+static void test_priority_comparator(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    flight_store_init(&fs);
+    request_init(&rq);
+    make_waiting(&fs, &rq, "A", FLIGHT_DEPARTURE);
+    make_waiting(&fs, &rq, "B", FLIGHT_ARRIVAL);
+    Flight *a = flight_find(&fs, "A");
+    Flight *b = flight_find(&fs, "B");
+
+    assert(flight_priority_higher(b, a));          /* ARRIVAL before DEPARTURE */
+    assert(!flight_priority_higher(a, b));
+    assert(!flight_priority_higher(a, a));         /* never higher than itself */
+    assert(!flight_priority_higher(NULL, a));
+
+    assert(flight_set_fuel(&fs, "A", FUEL_LOW) == ARMS_OK);
+    assert(flight_priority_higher(a, b));          /* fuel beats ARRIVAL */
+    assert(flight_set_emergency(&fs, "B", EMERGENCY_ACTIVE) == ARMS_OK);
+    assert(flight_priority_higher(b, a));          /* emergency beats fuel */
+
+    assert(flight_set_fuel(&fs, "A", (FuelLevel)9) == ARMS_ERR_INVALID_ARG);
+    assert(flight_set_emergency(&fs, "NOPE", EMERGENCY_ACTIVE) == ARMS_ERR_NOT_FOUND);
+    assert(flight_set_fuel(NULL, "A", FUEL_LOW) == ARMS_ERR_INVALID_ARG);
+}
+
+static void test_request_stamps(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    HoldingQueue h;
+    flight_store_init(&fs);
+    request_init(&rq);
+    holding_init(&h);
+
+    assert(flight_add(&fs, "F1", FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(flight_find(&fs, "F1")->emergency == EMERGENCY_NONE);
+    assert(flight_find(&fs, "F1")->fuel == FUEL_NORMAL);
+    fs.now = 7;
+    make_waiting(&fs, &rq, "F0", FLIGHT_ARRIVAL);
+    fs.now = 9;
+    assert(request_submit(&rq, &fs, "F1") == ARMS_OK);
+    assert(flight_find(&fs, "F0")->request_tick == 7 && flight_find(&fs, "F0")->request_seq == 0);
+    assert(flight_find(&fs, "F1")->request_tick == 9 && flight_find(&fs, "F1")->request_seq == 1);
+
+    /* Holding does not reset the request age. */
+    assert(holding_enter(&h, &rq, &fs, "F0") == ARMS_OK);
+    assert(holding_leave(&h, &rq, &fs, "F0") == ARMS_OK);
+    assert(flight_find(&fs, "F0")->request_tick == 7 && flight_find(&fs, "F0")->request_seq == 0);
+
+    /* A failed submit does not use up a sequence number. */
+    assert(request_submit(&rq, &fs, "F1") != ARMS_OK);
+    assert(fs.next_seq == 2);
+}
+
+static void test_heap_basic(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    MaxHeap h;
+    char out[ID_MAX_LEN + 1];
+    flight_store_init(&fs);
+    request_init(&rq);
+    heap_init(&h);
+
+    assert(heap_is_empty(&h) && heap_peek(&h) == NULL);
+    assert(heap_extract(&h, &fs, out) == ARMS_ERR_EMPTY);
+
+    /* Submitted in this order: D1(dep), A1(arr), A2(arr), D2(dep). */
+    make_waiting(&fs, &rq, "D1", FLIGHT_DEPARTURE);
+    make_waiting(&fs, &rq, "A1", FLIGHT_ARRIVAL);
+    make_waiting(&fs, &rq, "A2", FLIGHT_ARRIVAL);
+    make_waiting(&fs, &rq, "D2", FLIGHT_DEPARTURE);
+    const char *ids[] = { "D1", "A1", "A2", "D2" };
+    for (int i = 0; i < 4; i++)
+        assert(heap_insert(&h, &fs, ids[i]) == ARMS_OK);
+    assert(heap_count(&h) == 4 && heap_contains(&h, "A2"));
+    assert(strcmp(heap_peek(&h), "A1") == 0);
+
+    /* Extraction order: arrivals first (FIFO), then departures (FIFO). */
+    const char *expect[] = { "A1", "A2", "D1", "D2" };
+    for (int i = 0; i < 4; i++) {
+        assert(heap_extract(&h, &fs, out) == ARMS_OK);
+        assert(strcmp(out, expect[i]) == 0);
+    }
+    assert(heap_is_empty(&h));
+
+    /* Rejections. */
+    assert(heap_insert(&h, &fs, "A1") == ARMS_OK);
+    assert(heap_insert(&h, &fs, "A1") == ARMS_ERR_DUPLICATE);
+    assert(heap_insert(&h, &fs, "GHOST") == ARMS_ERR_NOT_FOUND);
+    assert(heap_insert(NULL, &fs, "A1") == ARMS_ERR_INVALID_ARG);
+    assert(heap_count(&h) == 1);
+}
+
+static void test_heap_rejects_invalid_states(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    HoldingQueue hq;
+    MaxHeap h;
+    flight_store_init(&fs);
+    request_init(&rq);
+    holding_init(&hq);
+    heap_init(&h);
+
+    assert(flight_add(&fs, "REG", FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    make_waiting(&fs, &rq, "HOLD", FLIGHT_ARRIVAL);
+    assert(holding_enter(&hq, &rq, &fs, "HOLD") == ARMS_OK);
+    add_flight_in_state(&fs, "SCH", STATE_SCHEDULED);
+    add_flight_in_state(&fs, "DONE", STATE_COMPLETED);
+    add_flight_in_state(&fs, "CANC", STATE_CANCELLED);
+
+    const char *bad[] = { "REG", "HOLD", "SCH", "DONE", "CANC" };
+    for (int i = 0; i < 5; i++)
+        assert(heap_insert(&h, &fs, bad[i]) == ARMS_ERR_NOT_ELIGIBLE);
+    assert(heap_is_empty(&h));
+}
+
+static void test_heap_full(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    MaxHeap h;
+    flight_store_init(&fs);
+    request_init(&rq);
+    heap_init(&h);
+
+    for (int i = 0; i < HEAP_CAPACITY; i++) {
+        char id[ID_MAX_LEN + 1];
+        snprintf(id, sizeof id, "F%d", i);
+        assert(flight_add(&fs, id, FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+        assert(request_submit(&rq, &fs, id) == ARMS_OK);
+        assert(heap_insert(&h, &fs, id) == ARMS_OK);
+    }
+    assert(heap_is_full(&h));
+    assert(heap_insert(&h, &fs, "F0") == ARMS_ERR_DUPLICATE);
+    assert(strcmp(heap_peek(&h), "F0") == 0);          /* oldest request first */
+
+    /* Every extract is the next-oldest request. */
+    for (int i = 0; i < HEAP_CAPACITY; i++) {
+        char out[ID_MAX_LEN + 1], want[ID_MAX_LEN + 1];
+        snprintf(want, sizeof want, "F%d", i);
+        assert(heap_extract(&h, &fs, out) == ARMS_OK);
+        assert(strcmp(out, want) == 0);
+    }
+    assert(heap_is_empty(&h));
+}
+
+static void test_heap_update_remove(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    MaxHeap h;
+    char out[ID_MAX_LEN + 1];
+    flight_store_init(&fs);
+    request_init(&rq);
+    heap_init(&h);
+
+    const char *ids[] = { "W1", "W2", "W3", "W4", "W5" };
+    for (int i = 0; i < 5; i++) {
+        make_waiting(&fs, &rq, ids[i], FLIGHT_ARRIVAL);
+        assert(heap_insert(&h, &fs, ids[i]) == ARMS_OK);
+    }
+    assert(strcmp(heap_peek(&h), "W1") == 0);
+
+    /* Raise priority of the newest flight: it must rise to the top. */
+    assert(flight_set_fuel(&fs, "W5", FUEL_LOW) == ARMS_OK);
+    assert(heap_update(&h, &fs, "W5") == ARMS_OK);
+    assert(strcmp(heap_peek(&h), "W5") == 0);
+
+    /* Lower it again: it must sink back. */
+    assert(flight_set_fuel(&fs, "W5", FUEL_NORMAL) == ARMS_OK);
+    assert(heap_update(&h, &fs, "W5") == ARMS_OK);
+    assert(strcmp(heap_peek(&h), "W1") == 0);
+    assert(heap_update(&h, &fs, "GHOST") == ARMS_ERR_NOT_FOUND);
+
+    /* Remove from the middle, then the rest still come out in order. */
+    assert(heap_remove(&h, &fs, "W3") == ARMS_OK);
+    assert(!heap_contains(&h, "W3") && heap_count(&h) == 4);
+    assert(heap_remove(&h, &fs, "W3") == ARMS_ERR_NOT_FOUND);
+    const char *expect[] = { "W1", "W2", "W4", "W5" };
+    for (int i = 0; i < 4; i++) {
+        assert(heap_extract(&h, &fs, out) == ARMS_OK);
+        assert(strcmp(out, expect[i]) == 0);
+    }
+}
+
+static void test_scheduler_priority_order(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    Scheduler s;
+    char order[256];
+    flight_store_init(&fs);
+    request_init(&rq);
+    scheduler_init(&s);
+
+    make_waiting(&fs, &rq, "DEP-OLD", FLIGHT_DEPARTURE);
+    make_waiting(&fs, &rq, "ARR-1", FLIGHT_ARRIVAL);
+    make_waiting(&fs, &rq, "ARR-2", FLIGHT_ARRIVAL);
+    make_waiting(&fs, &rq, "ARR-FUEL", FLIGHT_ARRIVAL);
+    make_waiting(&fs, &rq, "DEP-EMG", FLIGHT_DEPARTURE);
+    make_waiting(&fs, &rq, "ARR-CRIT", FLIGHT_ARRIVAL);
+    assert(flight_set_fuel(&fs, "ARR-FUEL", FUEL_LOW) == ARMS_OK);
+    assert(flight_set_fuel(&fs, "ARR-CRIT", FUEL_CRITICAL) == ARMS_OK);
+    assert(flight_set_emergency(&fs, "DEP-EMG", EMERGENCY_ACTIVE) == ARMS_OK);
+
+    assert(scheduler_peek(&s) == NULL);
+    assert(scheduler_pull(&s, &rq, &fs) == ARMS_OK);
+    assert(queue_is_empty(&rq.landing) && queue_is_empty(&rq.takeoff));
+    assert(scheduler_count(&s) == 6);
+
+    /* emergency, fuel critical, fuel low, then arrivals FIFO, then the departure. */
+    drain_order(&s, &fs, order, sizeof order);
+    assert(strcmp(order, "DEP-EMG ARR-CRIT ARR-FUEL ARR-1 ARR-2 DEP-OLD ") == 0);
+    assert(flight_find(&fs, "ARR-1")->state == STATE_SCHEDULED);
+
+    char id[ID_MAX_LEN + 1];
+    assert(scheduler_pop(&s, &fs, id) == ARMS_ERR_EMPTY);
+    assert(scheduler_pull(NULL, &rq, &fs) == ARMS_ERR_INVALID_ARG);
+}
+
+static void test_scheduler_waiting_time_tiebreak(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    Scheduler s;
+    char id[ID_MAX_LEN + 1];
+    flight_store_init(&fs);
+    request_init(&rq);
+    scheduler_init(&s);
+
+    /* Same type/fuel/emergency: smaller request_tick wins even with a larger seq. */
+    make_waiting(&fs, &rq, "LATE", FLIGHT_ARRIVAL);
+    make_waiting(&fs, &rq, "EARLY", FLIGHT_ARRIVAL);
+    flight_find(&fs, "LATE")->request_tick = 10;
+    flight_find(&fs, "EARLY")->request_tick = 3;
+    assert(scheduler_pull(&s, &rq, &fs) == ARMS_OK);
+    assert(scheduler_pop(&s, &fs, id) == ARMS_OK && strcmp(id, "EARLY") == 0);
+    assert(scheduler_pop(&s, &fs, id) == ARMS_OK && strcmp(id, "LATE") == 0);
+}
+
+static void test_scheduler_pull_rules(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    HoldingQueue hq;
+    Scheduler s;
+    char id[ID_MAX_LEN + 1];
+    flight_store_init(&fs);
+    request_init(&rq);
+    holding_init(&hq);
+    scheduler_init(&s);
+
+    make_waiting(&fs, &rq, "W1", FLIGHT_ARRIVAL);
+    make_waiting(&fs, &rq, "H1", FLIGHT_ARRIVAL);
+    assert(holding_enter(&hq, &rq, &fs, "H1") == ARMS_OK);
+    assert(flight_add(&fs, "R1", FLIGHT_DEPARTURE, AIRCRAFT_SMALL) == ARMS_OK);
+
+    assert(scheduler_pull(&s, &rq, &fs) == ARMS_OK);
+    assert(scheduler_contains(&s, "W1"));
+    assert(!scheduler_contains(&s, "H1") && !scheduler_contains(&s, "R1"));
+    assert(scheduler_count(&s) == 1);
+
+    /* A second pull never duplicates entries. */
+    assert(scheduler_pull(&s, &rq, &fs) == ARMS_OK);
+    assert(scheduler_count(&s) == 1);
+
+    /* peek is non-destructive. */
+    assert(strcmp(scheduler_peek(&s), "W1") == 0);
+    assert(scheduler_count(&s) == 1);
+    assert(flight_find(&fs, "W1")->state == STATE_WAITING);
+
+    /* A flight leaving holding is requeued, then pulled with its ORIGINAL age. */
+    make_waiting(&fs, &rq, "W2", FLIGHT_ARRIVAL);
+    assert(holding_leave(&hq, &rq, &fs, "H1") == ARMS_OK);
+    assert(scheduler_pull(&s, &rq, &fs) == ARMS_OK);
+    assert(scheduler_count(&s) == 3);
+    assert(scheduler_pop(&s, &fs, id) == ARMS_OK && strcmp(id, "W1") == 0);
+    assert(scheduler_pop(&s, &fs, id) == ARMS_OK && strcmp(id, "H1") == 0);   /* seq 1 < W2's 2 */
+    assert(scheduler_pop(&s, &fs, id) == ARMS_OK && strcmp(id, "W2") == 0);
+}
+
+static void test_scheduler_priority_update(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    HoldingQueue hq;
+    Scheduler s;
+    char id[ID_MAX_LEN + 1];
+    flight_store_init(&fs);
+    request_init(&rq);
+    holding_init(&hq);
+    scheduler_init(&s);
+
+    make_waiting(&fs, &rq, "A1", FLIGHT_ARRIVAL);
+    make_waiting(&fs, &rq, "A2", FLIGHT_ARRIVAL);
+    make_waiting(&fs, &rq, "A3", FLIGHT_ARRIVAL);
+    assert(scheduler_pull(&s, &rq, &fs) == ARMS_OK);
+    assert(strcmp(scheduler_peek(&s), "A1") == 0);
+
+    /* Emergency escalation of a flight already in the heap. */
+    assert(scheduler_set_emergency(&s, &fs, "A3", EMERGENCY_ACTIVE) == ARMS_OK);
+    assert(strcmp(scheduler_peek(&s), "A3") == 0);
+    /* Fuel change on a heap flight. */
+    assert(scheduler_set_fuel(&s, &fs, "A2", FUEL_CRITICAL) == ARMS_OK);
+    assert(scheduler_pop(&s, &fs, id) == ARMS_OK && strcmp(id, "A3") == 0);
+    assert(strcmp(scheduler_peek(&s), "A2") == 0);
+
+    /* Escalating a queued flight needs no heap work; it lands correctly on the next pull. */
+    make_waiting(&fs, &rq, "Q1", FLIGHT_DEPARTURE);
+    make_waiting(&fs, &rq, "Q2", FLIGHT_DEPARTURE);
+    assert(scheduler_set_emergency(&s, &fs, "Q2", EMERGENCY_ACTIVE) == ARMS_OK);
+    assert(!scheduler_contains(&s, "Q2"));
+    assert(scheduler_pull(&s, &rq, &fs) == ARMS_OK);
+    assert(scheduler_pop(&s, &fs, id) == ARMS_OK && strcmp(id, "Q2") == 0);
+
+    /* Escalating a HOLDING flight only sets the field; it stays in holding. */
+    make_waiting(&fs, &rq, "H1", FLIGHT_ARRIVAL);
+    assert(holding_enter(&hq, &rq, &fs, "H1") == ARMS_OK);
+    assert(scheduler_set_emergency(&s, &fs, "H1", EMERGENCY_ACTIVE) == ARMS_OK);
+    assert(flight_find(&fs, "H1")->emergency == EMERGENCY_ACTIVE);
+    assert(flight_find(&fs, "H1")->state == STATE_HOLDING);
+    assert(cqueue_contains(&hq.queue, "H1") && !scheduler_contains(&s, "H1"));
+
+    /* Errors. */
+    assert(scheduler_set_emergency(&s, &fs, "GHOST", EMERGENCY_ACTIVE) == ARMS_ERR_NOT_FOUND);
+    assert(scheduler_set_fuel(&s, &fs, "A2", (FuelLevel)9) == ARMS_ERR_INVALID_ARG);
+    add_flight_in_state(&fs, "DONE", STATE_COMPLETED);
+    assert(scheduler_set_fuel(&s, &fs, "DONE", FUEL_LOW) == ARMS_ERR_NOT_ELIGIBLE);
+}
+
+static void test_scheduler_hold(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    HoldingQueue hq;
+    Scheduler s;
+    flight_store_init(&fs);
+    request_init(&rq);
+    holding_init(&hq);
+    scheduler_init(&s);
+
+    make_waiting(&fs, &rq, "IN-HEAP", FLIGHT_ARRIVAL);
+    assert(scheduler_pull(&s, &rq, &fs) == ARMS_OK);
+    make_waiting(&fs, &rq, "IN-QUEUE", FLIGHT_DEPARTURE);
+
+    /* From the heap: leaves the heap and is only in holding afterwards. */
+    assert(scheduler_hold(&s, &hq, &rq, &fs, "IN-HEAP") == ARMS_OK);
+    assert(!scheduler_contains(&s, "IN-HEAP"));
+    assert(where_count(&hq, &rq, "IN-HEAP") == 1 && cqueue_contains(&hq.queue, "IN-HEAP"));
+    assert(flight_find(&fs, "IN-HEAP")->state == STATE_HOLDING);
+
+    /* From a normal queue: same as holding_enter. */
+    assert(scheduler_hold(&s, &hq, &rq, &fs, "IN-QUEUE") == ARMS_OK);
+    assert(where_count(&hq, &rq, "IN-QUEUE") == 1 && !scheduler_contains(&s, "IN-QUEUE"));
+
+    /* Errors change nothing. */
+    assert(scheduler_hold(&s, &hq, &rq, &fs, "IN-HEAP") == ARMS_ERR_DUPLICATE);
+    assert(scheduler_hold(&s, &hq, &rq, &fs, "GHOST") == ARMS_ERR_NOT_FOUND);
+    assert(scheduler_hold(NULL, &hq, &rq, &fs, "X") == ARMS_ERR_INVALID_ARG);
+    assert(holding_count(&hq) == 2 && scheduler_count(&s) == 0);
+}
+
+static void test_scheduler_hold_full_holding(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    HoldingQueue hq;
+    Scheduler s;
+    flight_store_init(&fs);
+    request_init(&rq);
+    holding_init(&hq);
+    scheduler_init(&s);
+
+    for (int i = 0; i < CQUEUE_CAPACITY; i++) {
+        char id[ID_MAX_LEN + 1];
+        snprintf(id, sizeof id, "P%d", i);
+        assert(cqueue_enqueue(&hq.queue, id) == ARMS_OK);
+    }
+    make_waiting(&fs, &rq, "WAIT", FLIGHT_ARRIVAL);
+    assert(scheduler_pull(&s, &rq, &fs) == ARMS_OK);
+
+    /* The heap flight must stay in the heap, untouched. */
+    assert(scheduler_hold(&s, &hq, &rq, &fs, "WAIT") == ARMS_ERR_FULL);
+    assert(scheduler_contains(&s, "WAIT") && queue_is_empty(&rq.landing));
+    assert(flight_find(&fs, "WAIT")->state == STATE_WAITING);
+}
+
 int main(void)
 {
     test_ids_and_common();
@@ -894,6 +1299,18 @@ int main(void)
     test_holding_enter_leave();
     test_holding_enter_failures();
     test_holding_leave_failures();
+    test_priority_comparator();
+    test_request_stamps();
+    test_heap_basic();
+    test_heap_rejects_invalid_states();
+    test_heap_full();
+    test_heap_update_remove();
+    test_scheduler_priority_order();
+    test_scheduler_waiting_time_tiebreak();
+    test_scheduler_pull_rules();
+    test_scheduler_priority_update();
+    test_scheduler_hold();
+    test_scheduler_hold_full_holding();
 
     printf("All core tests passed.\n");
     return 0;

@@ -19,7 +19,7 @@ typedef enum {
     ARMS_ERR_RUNWAY_OCCUPIED,
     ARMS_ERR_RUNWAY_CLOSED,
     ARMS_ERR_NOT_OCCUPIED,
-    ARMS_ERR_NOT_ELIGIBLE,       /* flight is not WAITING or HOLDING */
+    ARMS_ERR_NOT_ELIGIBLE,       /* current state does not permit this operation */
     ARMS_ERR_INCOMPATIBLE,
     ARMS_ERR_EMPTY
 } ArmsStatus;
