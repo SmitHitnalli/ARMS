@@ -8,6 +8,8 @@
 #include "runway.h"
 #include "queue.h"
 #include "request.h"
+#include "cqueue.h"
+#include "holding.h"
 
 /* Independent copy of the approved transition table, to check flight.c against. */
 static const int expected[STATE_COUNT][STATE_COUNT] = {
@@ -601,6 +603,276 @@ static void test_request_full_queue(void)
     assert(flight_find(&fs, "ARR-1")->state == STATE_WAITING);
 }
 
+/* ---- Phase 4: queue_remove, circular queue, holding ---- */
+
+static void test_queue_remove(void)
+{
+    Queue q;
+    char out[ID_MAX_LEN + 1];
+
+    queue_init(&q);
+    assert(queue_remove(&q, "A") == ARMS_ERR_NOT_FOUND);
+    assert(queue_remove(NULL, "A") == ARMS_ERR_INVALID_ARG);
+    assert(queue_remove(&q, NULL) == ARMS_ERR_INVALID_ARG);
+
+    queue_enqueue(&q, "A");
+    queue_enqueue(&q, "B");
+    queue_enqueue(&q, "C");
+    queue_enqueue(&q, "D");
+    assert(queue_remove(&q, "B") == ARMS_OK);       /* middle */
+    assert(queue_remove(&q, "B") == ARMS_ERR_NOT_FOUND);
+    assert(queue_remove(&q, "D") == ARMS_OK);       /* last */
+    assert(queue_count(&q) == 2);
+    assert(strcmp(queue_at(&q, 0), "A") == 0 && strcmp(queue_at(&q, 1), "C") == 0);
+    assert(queue_remove(&q, "A") == ARMS_OK);       /* front */
+    assert(queue_dequeue(&q, out) == ARMS_OK && strcmp(out, "C") == 0);
+    assert(queue_is_empty(&q));
+
+    /* Still usable afterwards, and removal works after the front has moved. */
+    queue_enqueue(&q, "E");
+    queue_enqueue(&q, "F");
+    queue_dequeue(&q, out);
+    queue_enqueue(&q, "G");
+    assert(queue_remove(&q, "G") == ARMS_OK);
+    assert(queue_count(&q) == 1 && strcmp(queue_front(&q), "F") == 0);
+}
+
+static void test_cqueue_basic(void)
+{
+    CircularQueue q;
+    char out[ID_MAX_LEN + 1];
+
+    cqueue_init(&q);
+    assert(cqueue_is_empty(&q) && !cqueue_is_full(&q));
+    assert(cqueue_front(&q) == NULL);
+    assert(cqueue_dequeue(&q, out) == ARMS_ERR_EMPTY);
+
+    assert(cqueue_enqueue(&q, "A") == ARMS_OK);
+    assert(cqueue_enqueue(&q, "B") == ARMS_OK);
+    assert(cqueue_enqueue(&q, "bad id") == ARMS_ERR_INVALID_ID);
+    assert(cqueue_enqueue(&q, NULL) == ARMS_ERR_INVALID_ARG);
+    assert(cqueue_enqueue(NULL, "C") == ARMS_ERR_INVALID_ARG);
+    assert(cqueue_dequeue(&q, NULL) == ARMS_ERR_INVALID_ARG);
+    assert(cqueue_count(&q) == 2 && cqueue_contains(&q, "B") && !cqueue_contains(&q, "C"));
+
+    assert(cqueue_dequeue(&q, out) == ARMS_OK && strcmp(out, "A") == 0);
+    assert(cqueue_dequeue(&q, out) == ARMS_OK && strcmp(out, "B") == 0);
+    assert(cqueue_is_empty(&q));
+    assert(cqueue_at(&q, 0) == NULL);
+}
+
+static void test_cqueue_wraparound(void)
+{
+    CircularQueue q;
+    char id[ID_MAX_LEN + 1];
+    char out[ID_MAX_LEN + 1];
+
+    cqueue_init(&q);
+    for (int i = 0; i < CQUEUE_CAPACITY; i++) {
+        snprintf(id, sizeof id, "W-%d", i);
+        assert(cqueue_enqueue(&q, id) == ARMS_OK);
+    }
+    assert(cqueue_is_full(&q));
+    assert(cqueue_enqueue(&q, "EXTRA") == ARMS_ERR_FULL);
+    assert(q.rear == 0);                            /* rear wrapped to the start */
+
+    /* Free 3 slots at the front, then refill: the new items wrap around. */
+    for (int i = 0; i < 3; i++) {
+        assert(cqueue_dequeue(&q, out) == ARMS_OK);
+        snprintf(id, sizeof id, "W-%d", i);
+        assert(strcmp(out, id) == 0);
+    }
+    for (int i = 0; i < 3; i++) {
+        snprintf(id, sizeof id, "N-%d", i);
+        assert(cqueue_enqueue(&q, id) == ARMS_OK);
+    }
+    assert(cqueue_is_full(&q) && q.rear == 3 && q.front == 3);
+    assert(strcmp(cqueue_at(&q, 0), "W-3") == 0);
+    assert(strcmp(cqueue_at(&q, CQUEUE_CAPACITY - 1), "N-2") == 0);
+    assert(cqueue_contains(&q, "N-0") && !cqueue_contains(&q, "W-0"));
+
+    /* Remove from the wrapped part and from the front; order must be preserved. */
+    assert(cqueue_remove(&q, "N-1") == ARMS_OK);
+    assert(cqueue_remove(&q, "W-3") == ARMS_OK);
+    assert(cqueue_remove(&q, "W-3") == ARMS_ERR_NOT_FOUND);
+    assert(cqueue_remove(&q, NULL) == ARMS_ERR_INVALID_ARG);
+    assert(cqueue_count(&q) == CQUEUE_CAPACITY - 2);
+    assert(strcmp(cqueue_at(&q, 0), "W-4") == 0);
+    assert(strcmp(cqueue_at(&q, CQUEUE_CAPACITY - 4), "N-0") == 0);
+    assert(strcmp(cqueue_at(&q, CQUEUE_CAPACITY - 3), "N-2") == 0);
+
+    /* Drain: strict FIFO order across the wrap point. */
+    for (int i = 4; i < CQUEUE_CAPACITY; i++) {
+        snprintf(id, sizeof id, "W-%d", i);
+        assert(cqueue_dequeue(&q, out) == ARMS_OK && strcmp(out, id) == 0);
+    }
+    assert(cqueue_dequeue(&q, out) == ARMS_OK && strcmp(out, "N-0") == 0);
+    assert(cqueue_dequeue(&q, out) == ARMS_OK && strcmp(out, "N-2") == 0);
+    assert(cqueue_is_empty(&q));
+}
+
+/* Registers a flight and submits it, so it is WAITING and in its normal queue. */
+static void make_waiting(FlightStore *fs, RequestQueues *rq, const char *id, FlightType type)
+{
+    assert(flight_add(fs, id, type, AIRCRAFT_MEDIUM) == ARMS_OK);
+    assert(request_submit(rq, fs, id) == ARMS_OK);
+}
+
+/* 1 if id is in the holding queue or a normal queue, counted: used to prove "exactly one". */
+static int where_count(const HoldingQueue *h, const RequestQueues *rq, const char *id)
+{
+    return cqueue_contains(&h->queue, id) + queue_contains(&rq->landing, id)
+         + queue_contains(&rq->takeoff, id);
+}
+
+static void test_holding_enter_leave(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    HoldingQueue h;
+
+    flight_store_init(&fs);
+    request_init(&rq);
+    holding_init(&h);
+    make_waiting(&fs, &rq, "ARR-1", FLIGHT_ARRIVAL);
+    make_waiting(&fs, &rq, "DEP-1", FLIGHT_DEPARTURE);
+    make_waiting(&fs, &rq, "ARR-2", FLIGHT_ARRIVAL);
+    make_waiting(&fs, &rq, "ARR-3", FLIGHT_ARRIVAL);
+
+    /* Enter from the middle of the landing queue: removed there, FIFO order kept. */
+    assert(holding_enter(&h, &rq, &fs, "ARR-2") == ARMS_OK);
+    assert(flight_find(&fs, "ARR-2")->state == STATE_HOLDING);
+    assert(!queue_contains(&rq.landing, "ARR-2") && !queue_contains(&rq.takeoff, "ARR-2"));
+    assert(cqueue_contains(&h.queue, "ARR-2") && holding_count(&h) == 1);
+    assert(queue_count(&rq.landing) == 2);
+    assert(strcmp(queue_at(&rq.landing, 0), "ARR-1") == 0);
+    assert(strcmp(queue_at(&rq.landing, 1), "ARR-3") == 0);
+
+    /* A departure is taken from the takeoff queue, not the landing queue. */
+    assert(holding_enter(&h, &rq, &fs, "DEP-1") == ARMS_OK);
+    assert(queue_is_empty(&rq.takeoff) && queue_count(&rq.landing) == 2);
+    assert(holding_count(&h) == 2);
+
+    /* Duplicate entry is rejected. */
+    assert(holding_enter(&h, &rq, &fs, "ARR-2") == ARMS_ERR_DUPLICATE);
+
+    /* Leaving puts the flight at the REAR of the correct normal queue. */
+    assert(holding_leave(&h, &rq, &fs, "ARR-2") == ARMS_OK);
+    assert(flight_find(&fs, "ARR-2")->state == STATE_WAITING);
+    assert(queue_count(&rq.landing) == 3);
+    assert(strcmp(queue_at(&rq.landing, 0), "ARR-1") == 0);
+    assert(strcmp(queue_at(&rq.landing, 1), "ARR-3") == 0);
+    assert(strcmp(queue_at(&rq.landing, 2), "ARR-2") == 0);
+    assert(queue_is_empty(&rq.takeoff));
+
+    assert(holding_leave(&h, &rq, &fs, "DEP-1") == ARMS_OK);
+    assert(queue_count(&rq.takeoff) == 1 && strcmp(queue_front(&rq.takeoff), "DEP-1") == 0);
+    assert(!queue_contains(&rq.landing, "DEP-1"));
+    assert(holding_count(&h) == 0);
+
+    /* A flight is in exactly one place at all times; enter again after leaving works. */
+    const char *all[] = { "ARR-1", "DEP-1", "ARR-2", "ARR-3" };
+    for (int i = 0; i < 4; i++)
+        assert(where_count(&h, &rq, all[i]) == 1);
+    assert(holding_enter(&h, &rq, &fs, "ARR-1") == ARMS_OK);
+    for (int i = 0; i < 4; i++)
+        assert(where_count(&h, &rq, all[i]) == 1);
+    assert(flight_find(&fs, "ARR-1")->state == STATE_HOLDING);
+}
+
+static void test_holding_enter_failures(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    HoldingQueue h;
+
+    flight_store_init(&fs);
+    request_init(&rq);
+    holding_init(&h);
+    make_waiting(&fs, &rq, "ARR-1", FLIGHT_ARRIVAL);
+    assert(flight_add(&fs, "REG-1", FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    /* WAITING in the store but missing from its normal queue (inconsistent on purpose). */
+    assert(flight_add(&fs, "GHOST", FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(flight_transition(&fs, "GHOST", STATE_WAITING) == ARMS_OK);
+
+    RequestQueues rq_before = rq;
+    assert(holding_enter(NULL, &rq, &fs, "ARR-1") == ARMS_ERR_INVALID_ARG);
+    assert(holding_enter(&h, NULL, &fs, "ARR-1") == ARMS_ERR_INVALID_ARG);
+    assert(holding_enter(&h, &rq, NULL, "ARR-1") == ARMS_ERR_INVALID_ARG);
+    assert(holding_enter(&h, &rq, &fs, NULL) == ARMS_ERR_INVALID_ARG);
+    assert(holding_enter(&h, &rq, &fs, "NOPE") == ARMS_ERR_NOT_FOUND);
+    assert(holding_enter(&h, &rq, &fs, "REG-1") == ARMS_ERR_INVALID_TRANSITION);
+    assert(holding_enter(&h, &rq, &fs, "GHOST") == ARMS_ERR_NOT_FOUND);
+    assert(flight_find(&fs, "REG-1")->state == STATE_REGISTERED);
+    assert(flight_find(&fs, "GHOST")->state == STATE_WAITING);
+    assert(holding_count(&h) == 0);
+    assert(same_queue_state(&rq.landing, &rq_before.landing));
+    assert(same_queue_state(&rq.takeoff, &rq_before.takeoff));
+
+    /* Full holding queue: ARR-1 stays WAITING and stays in the landing queue. */
+    char id[ID_MAX_LEN + 1];
+    for (int i = 0; i < CQUEUE_CAPACITY; i++) {
+        snprintf(id, sizeof id, "Z-%d", i);
+        assert(cqueue_enqueue(&h.queue, id) == ARMS_OK);
+    }
+    assert(holding_enter(&h, &rq, &fs, "ARR-1") == ARMS_ERR_FULL);
+    assert(flight_find(&fs, "ARR-1")->state == STATE_WAITING);
+    assert(queue_contains(&rq.landing, "ARR-1") && !cqueue_contains(&h.queue, "ARR-1"));
+    assert(holding_count(&h) == CQUEUE_CAPACITY);
+    assert(same_queue_state(&rq.landing, &rq_before.landing));
+}
+
+static void test_holding_leave_failures(void)
+{
+    FlightStore fs;
+    RequestQueues rq;
+    HoldingQueue h;
+    char id[ID_MAX_LEN + 1];
+
+    flight_store_init(&fs);
+    request_init(&rq);
+    holding_init(&h);
+    make_waiting(&fs, &rq, "ARR-1", FLIGHT_ARRIVAL);
+    make_waiting(&fs, &rq, "ARR-2", FLIGHT_ARRIVAL);
+    /* HOLDING in the store but missing from the holding queue (inconsistent on purpose). */
+    assert(flight_add(&fs, "GHOST", FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(flight_transition(&fs, "GHOST", STATE_WAITING) == ARMS_OK);
+    assert(flight_transition(&fs, "GHOST", STATE_HOLDING) == ARMS_OK);
+
+    assert(holding_leave(NULL, &rq, &fs, "ARR-1") == ARMS_ERR_INVALID_ARG);
+    assert(holding_leave(&h, &rq, &fs, NULL) == ARMS_ERR_INVALID_ARG);
+    assert(holding_leave(&h, &rq, &fs, "NOPE") == ARMS_ERR_NOT_FOUND);
+    assert(holding_leave(&h, &rq, &fs, "ARR-1") == ARMS_ERR_INVALID_TRANSITION);  /* WAITING */
+    assert(holding_leave(&h, &rq, &fs, "GHOST") == ARMS_ERR_NOT_FOUND);
+    assert(flight_find(&fs, "ARR-1")->state == STATE_WAITING);
+    assert(flight_find(&fs, "GHOST")->state == STATE_HOLDING);
+    assert(queue_count(&rq.landing) == 2 && holding_count(&h) == 0);
+
+    /* Full normal queue: the flight stays in holding and stays HOLDING. */
+    assert(holding_enter(&h, &rq, &fs, "ARR-1") == ARMS_OK);
+    queue_init(&rq.landing);
+    for (int i = 0; i < QUEUE_CAPACITY; i++) {
+        snprintf(id, sizeof id, "Q-%d", i);
+        assert(queue_enqueue(&rq.landing, id) == ARMS_OK);
+    }
+    RequestQueues rq_before = rq;
+    assert(holding_leave(&h, &rq, &fs, "ARR-1") == ARMS_ERR_FULL);
+    assert(flight_find(&fs, "ARR-1")->state == STATE_HOLDING);
+    assert(cqueue_contains(&h.queue, "ARR-1") && !queue_contains(&rq.landing, "ARR-1"));
+    assert(same_queue_state(&rq.landing, &rq_before.landing));
+
+    /* Already in a normal queue as well (inconsistent on purpose): rejected, nothing moves. */
+    queue_init(&rq.takeoff);
+    assert(flight_add(&fs, "DEP-1", FLIGHT_DEPARTURE, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(flight_transition(&fs, "DEP-1", STATE_WAITING) == ARMS_OK);
+    assert(flight_transition(&fs, "DEP-1", STATE_HOLDING) == ARMS_OK);
+    assert(cqueue_enqueue(&h.queue, "DEP-1") == ARMS_OK);
+    assert(queue_enqueue(&rq.takeoff, "DEP-1") == ARMS_OK);
+    assert(holding_leave(&h, &rq, &fs, "DEP-1") == ARMS_ERR_DUPLICATE);
+    assert(flight_find(&fs, "DEP-1")->state == STATE_HOLDING);
+    assert(cqueue_contains(&h.queue, "DEP-1") && queue_count(&rq.takeoff) == 1);
+}
+
 int main(void)
 {
     test_ids_and_common();
@@ -616,6 +888,12 @@ int main(void)
     test_request_submit();
     test_request_rejects_non_registered();
     test_request_full_queue();
+    test_queue_remove();
+    test_cqueue_basic();
+    test_cqueue_wraparound();
+    test_holding_enter_leave();
+    test_holding_enter_failures();
+    test_holding_leave_failures();
 
     printf("All core tests passed.\n");
     return 0;

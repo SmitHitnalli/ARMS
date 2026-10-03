@@ -22,6 +22,9 @@ ArmsStatus  queue_enqueue(Queue *q, const char *id);
 /* Copies the front ID into out_id (needs ID_MAX_LEN + 1 bytes). INVALID_ARG or EMPTY. */
 ArmsStatus  queue_dequeue(Queue *q, char *out_id);
 
+/* O(n). Removes id from anywhere in the queue, keeping FIFO order. INVALID_ARG or NOT_FOUND. */
+ArmsStatus  queue_remove(Queue *q, const char *id);
+
 /* NULL if empty. The pointer is invalidated by the next enqueue or dequeue. */
 const char *queue_front(const Queue *q);
 

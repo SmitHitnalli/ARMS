@@ -8,7 +8,7 @@ TARGET  = $(BUILD)/arms.exe
 TEST    = $(BUILD)/test_core.exe
 
 # Core modules: no GTK, shared by the app and the tests.
-CORE    = src/common.c src/flight.c src/runway.c src/queue.c src/request.c
+CORE    = src/common.c src/flight.c src/runway.c src/queue.c src/request.c src/cqueue.c src/holding.c
 HEADERS = $(wildcard include/*.h)
 
 all: $(TARGET)

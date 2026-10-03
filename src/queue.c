@@ -50,6 +50,27 @@ ArmsStatus queue_dequeue(Queue *q, char *out_id)
     return ARMS_OK;
 }
 
+ArmsStatus queue_remove(Queue *q, const char *id)
+{
+    if (q == NULL || id == NULL)
+        return ARMS_ERR_INVALID_ARG;
+
+    for (int i = q->front; i < q->rear; i++) {
+        if (strcmp(q->ids[i], id) != 0)
+            continue;
+        /* Shift the later items one place toward the front. */
+        memmove(q->ids[i], q->ids[i + 1], (size_t)(q->rear - i - 1) * sizeof q->ids[0]);
+        q->rear--;
+        q->count--;
+        if (q->count == 0) {
+            q->front = 0;
+            q->rear = 0;
+        }
+        return ARMS_OK;
+    }
+    return ARMS_ERR_NOT_FOUND;
+}
+
 const char *queue_front(const Queue *q)
 {
     if (q == NULL || q->count == 0)
