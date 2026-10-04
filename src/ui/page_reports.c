@@ -1,5 +1,6 @@
 #include "page_reports.h"
 #include "reports.h"
+#include "ui_common.h"
 
 static const char *const FLIGHT_KEYS[] = { "ID", "Request order", "Scheduler priority", NULL };
 static const char *const HIST_KEYS[]   = { "Flight ID", "Completion", NULL };
@@ -9,32 +10,7 @@ static const char *const FLIGHT_HEADERS[] = { "ID", "Type", "Category", "State",
 static const char *const HIST_HEADERS[]   = { "Flight ID", "Type", "Category", "Runway",
                                               "Request Tick", "Request Seq", "Completed Tick" };
 #define COLUMNS 7
-
-static void add_cell(GtkWidget *grid, int col, int row, const char *text, const char *css)
-{
-    GtkWidget *label = gtk_label_new(text);
-    gtk_widget_add_css_class(label, css);
-    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
-    gtk_widget_set_hexpand(label, TRUE);
-    gtk_grid_attach(GTK_GRID(grid), label, col, row, 1, 1);
-}
-
-/* Clears a grid and draws its header row. */
-static void reset_grid(GtkWidget *grid, const char *const *headers)
-{
-    GtkWidget *child;
-    while ((child = gtk_widget_get_first_child(grid)) != NULL)
-        gtk_grid_remove(GTK_GRID(grid), child);
-    for (int c = 0; c < COLUMNS; c++)
-        add_cell(grid, c, 0, headers[c], "table-header");
-}
-
-static void add_empty(GtkWidget *grid, const char *text)
-{
-    GtkWidget *empty = gtk_label_new(text);
-    gtk_widget_add_css_class(empty, "dim-label");
-    gtk_grid_attach(GTK_GRID(grid), empty, 0, 1, COLUMNS, 1);
-}
+#define HIST_NUMERIC (7u << 4)   /* Request Tick, Request Seq, Completed Tick */
 
 static void add_flight_row(GtkWidget *grid, int row, const Flight *f)
 {
@@ -44,17 +20,17 @@ static void add_flight_row(GtkWidget *grid, int row, const Flight *f)
         flight_fuel_name(f->fuel), f->runway_id[0] != '\0' ? f->runway_id : "-"
     };
     for (int c = 0; c < COLUMNS; c++)
-        add_cell(grid, c, row, cells[c], "table-cell");
+        ui_add_cell(grid, c, row, cells[c], "table-cell", 0);
 }
 
 static void fill_flights(AppCtx *ctx)
 {
     ReportsWidgets *w = &ctx->reports_page;
-    reset_grid(w->flight_grid, FLIGHT_HEADERS);
+    ui_reset_grid(w->flight_grid, FLIGHT_HEADERS, COLUMNS, 0);
 
     int cap = flight_count(&ctx->sys.flights), n = 0;
     if (cap == 0) {
-        add_empty(w->flight_grid, "No flights yet");
+        ui_add_empty(w->flight_grid, COLUMNS, "No flights yet");
         return;
     }
     const Flight **rows = g_new(const Flight *, cap);
@@ -72,11 +48,11 @@ static void fill_flights(AppCtx *ctx)
 static void fill_history(AppCtx *ctx)
 {
     ReportsWidgets *w = &ctx->reports_page;
-    reset_grid(w->hist_grid, HIST_HEADERS);
+    ui_reset_grid(w->hist_grid, HIST_HEADERS, COLUMNS, HIST_NUMERIC);
 
     int cap = history_count(&ctx->sys.history), n = 0;
     if (cap == 0) {
-        add_empty(w->hist_grid, "No completed movements yet");
+        ui_add_empty(w->hist_grid, COLUMNS, "No completed movements yet");
         return;
     }
     const Movement **rows = g_new(const Movement *, cap);
@@ -97,7 +73,7 @@ static void fill_history(AppCtx *ctx)
             m->runway_id, tick, seq, done
         };
         for (int c = 0; c < COLUMNS; c++)
-            add_cell(w->hist_grid, c, i + 1, cells[c], "table-cell");
+            ui_add_cell(w->hist_grid, c, i + 1, cells[c], "table-cell", (HIST_NUMERIC >> c) & 1u);
     }
     g_free(rows);
 }
@@ -158,25 +134,16 @@ static void on_find_clicked(GtkButton *button, gpointer user_data)
     g_free(sorted);
 }
 
-static GtkWidget *section_title(const char *text)
-{
-    GtkWidget *label = gtk_label_new(text);
-    gtk_widget_add_css_class(label, "card-title");
-    gtk_widget_set_halign(label, GTK_ALIGN_START);
-    return label;
-}
-
 /* Sort row: label, key dropdown, order dropdown; both re-render the table on change. */
 static GtkWidget *sort_row(AppCtx *ctx, const char *const *keys, GtkWidget **key_dd,
                            GtkWidget **order_dd, GCallback on_changed)
 {
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_widget_add_css_class(row, "form-row");
+    GtkWidget *row = ui_form_row();
     *key_dd = gtk_drop_down_new_from_strings(keys);
     *order_dd = gtk_drop_down_new_from_strings(ORDERS);
     g_signal_connect(*key_dd, "notify::selected", on_changed, ctx);
     g_signal_connect(*order_dd, "notify::selected", on_changed, ctx);
-    gtk_box_append(GTK_BOX(row), gtk_label_new("Sort by:"));
+    gtk_box_append(GTK_BOX(row), ui_form_label("Sort by"));
     gtk_box_append(GTK_BOX(row), *key_dd);
     gtk_box_append(GTK_BOX(row), *order_dd);
     return row;
@@ -185,16 +152,10 @@ static GtkWidget *sort_row(AppCtx *ctx, const char *const *keys, GtkWidget **key
 GtkWidget *page_reports_new(AppCtx *ctx)
 {
     ReportsWidgets *w = &ctx->reports_page;
-    GtkWidget *content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_widget_add_css_class(content, "page");
-
-    GtkWidget *heading = gtk_label_new("Reports");
-    gtk_widget_add_css_class(heading, "page-title");
-    gtk_widget_set_halign(heading, GTK_ALIGN_START);
-    gtk_box_append(GTK_BOX(content), heading);
+    GtkWidget *content = ui_page_new("Reports");
 
     /* flight report */
-    gtk_box_append(GTK_BOX(content), section_title("Flight report"));
+    gtk_box_append(GTK_BOX(content), ui_section_title("Flight report"));
     gtk_box_append(GTK_BOX(content), sort_row(ctx, FLIGHT_KEYS, &w->flight_key_dd,
                                               &w->flight_order_dd,
                                               G_CALLBACK(on_flight_sort_changed)));
@@ -206,14 +167,13 @@ GtkWidget *page_reports_new(AppCtx *ctx)
     gtk_box_append(GTK_BOX(content), w->flight_grid);
 
     /* binary search */
-    gtk_box_append(GTK_BOX(content), section_title("Find flight by ID (binary search)"));
-    GtkWidget *find_form = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_widget_add_css_class(find_form, "form-row");
+    gtk_box_append(GTK_BOX(content), ui_section_title("Find flight by ID (binary search)"));
+    GtkWidget *find_form = ui_form_row();
     w->find_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(w->find_entry), "Flight ID");
-    GtkWidget *find = gtk_button_new_with_label("Find");
-    g_signal_connect(find, "clicked", G_CALLBACK(on_find_clicked), ctx);
+    GtkWidget *find = ui_button("Find", G_CALLBACK(on_find_clicked), ctx);
     g_signal_connect_swapped(w->find_entry, "activate", G_CALLBACK(gtk_widget_activate), find);
+    gtk_box_append(GTK_BOX(find_form), ui_form_label("Flight ID"));
     gtk_box_append(GTK_BOX(find_form), w->find_entry);
     gtk_box_append(GTK_BOX(find_form), find);
     gtk_box_append(GTK_BOX(content), find_form);
@@ -223,16 +183,12 @@ GtkWidget *page_reports_new(AppCtx *ctx)
     gtk_box_append(GTK_BOX(content), w->find_label);
 
     /* movement report */
-    gtk_box_append(GTK_BOX(content), section_title("Movement report"));
+    gtk_box_append(GTK_BOX(content), ui_section_title("Movement report"));
     gtk_box_append(GTK_BOX(content), sort_row(ctx, HIST_KEYS, &w->hist_key_dd,
                                               &w->hist_order_dd, G_CALLBACK(on_hist_sort_changed)));
     w->hist_grid = gtk_grid_new();
     gtk_box_append(GTK_BOX(content), w->hist_grid);
 
-    GtkWidget *scroll = gtk_scrolled_window_new();
-    gtk_widget_set_vexpand(scroll, TRUE);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), content);
-
     page_reports_refresh(ctx);
-    return scroll;
+    return ui_scroll_new(content);
 }

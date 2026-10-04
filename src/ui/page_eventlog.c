@@ -2,18 +2,12 @@
 
 #include <string.h>
 
+#include "ui_common.h"
+
 static const char *const HEADERS[] = { "Seq", "Tick", "Event", "Flight", "Runway", "Details" };
 #define COLUMNS 6
+#define NUMERIC 3u   /* Seq, Tick */
 #define ALL_TYPES 0   /* dropdown index 0 is "All"; index i + 1 is EventType i */
-
-static void add_cell(GtkWidget *grid, int col, int row, const char *text, const char *css)
-{
-    GtkWidget *label = gtk_label_new(text);
-    gtk_widget_add_css_class(label, css);
-    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
-    gtk_widget_set_hexpand(label, TRUE);
-    gtk_grid_attach(GTK_GRID(grid), label, col, row, 1, 1);
-}
 
 static int matches(const Event *e, guint type_sel, const char *flight_filter)
 {
@@ -26,12 +20,8 @@ void page_eventlog_refresh(AppCtx *ctx)
 {
     EventLogWidgets *w = &ctx->eventlog_page;
     const EventLog *log = &ctx->sys.events;
-    GtkWidget *child;
 
-    while ((child = gtk_widget_get_first_child(w->grid)) != NULL)
-        gtk_grid_remove(GTK_GRID(w->grid), child);
-    for (int c = 0; c < COLUMNS; c++)
-        add_cell(w->grid, c, 0, HEADERS[c], "table-header");
+    ui_reset_grid(w->grid, HEADERS, COLUMNS, NUMERIC);
 
     /* Flight IDs are upper-case, so an upper-cased filter makes the search case-insensitive. */
     char flight_filter[ID_MAX_LEN + 1];
@@ -61,17 +51,21 @@ void page_eventlog_refresh(AppCtx *ctx)
             e->flight_id[0] ? e->flight_id : "-", e->runway_id[0] ? e->runway_id : "-",
             e->details[0] ? e->details : "-"
         };
-        for (int c = 0; c < COLUMNS; c++)
-            add_cell(w->grid, c, i + 1, cells[c], "table-cell");
+        for (int c = 0; c < COLUMNS; c++) {
+            GtkWidget *cell = ui_add_cell(w->grid, c, i + 1, cells[c], "table-cell", (NUMERIC >> c) & 1u);
+            if (c == COLUMNS - 1) {   /* details can be long: wrap, full text in the tooltip */
+                gtk_label_set_wrap(GTK_LABEL(cell), TRUE);
+                gtk_label_set_wrap_mode(GTK_LABEL(cell), PANGO_WRAP_WORD_CHAR);
+                gtk_label_set_max_width_chars(GTK_LABEL(cell), 60);
+                gtk_widget_set_tooltip_text(cell, cells[c]);
+            }
+        }
     }
     g_free(shown);
 
-    if (n == 0) {
-        GtkWidget *empty = gtk_label_new(log->count == 0 ? "No events recorded yet"
-                                                         : "No events match the filters");
-        gtk_widget_add_css_class(empty, "dim-label");
-        gtk_grid_attach(GTK_GRID(w->grid), empty, 0, 1, COLUMNS, 1);
-    }
+    if (n == 0)
+        ui_add_empty(w->grid, COLUMNS, log->count == 0 ? "No events recorded yet"
+                                                       : "No events match the filters");
 
     char status[112];
     int len = snprintf(status, sizeof status, "Total events: %d   Shown: %d", log->count, n);
@@ -91,39 +85,33 @@ static void on_filter_changed(GObject *source, GParamSpec *pspec, gpointer user_
 GtkWidget *page_eventlog_new(AppCtx *ctx)
 {
     EventLogWidgets *w = &ctx->eventlog_page;
-    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
-    gtk_widget_add_css_class(page, "page");
+    GtkWidget *page = ui_page_new("Event Log");
 
-    GtkWidget *heading = gtk_label_new("Event Log");
-    gtk_widget_add_css_class(heading, "page-title");
-    gtk_widget_set_halign(heading, GTK_ALIGN_START);
-    gtk_box_append(GTK_BOX(page), heading);
-
-    GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *bar = ui_form_row();
     GtkStringList *types = gtk_string_list_new(NULL);
     gtk_string_list_append(types, "All events");
     for (int t = 0; t < EVENT_TYPE_COUNT; t++)
         gtk_string_list_append(types, eventlog_type_name((EventType)t));
     w->type_dd = gtk_drop_down_new(G_LIST_MODEL(types), NULL);
     g_signal_connect(w->type_dd, "notify::selected", G_CALLBACK(on_filter_changed), ctx);
+    gtk_box_append(GTK_BOX(bar), ui_form_label("Event type"));
     gtk_box_append(GTK_BOX(bar), w->type_dd);
 
     w->flight_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(w->flight_entry), "Filter by flight ID");
     gtk_entry_set_max_length(GTK_ENTRY(w->flight_entry), ID_MAX_LEN);
     g_signal_connect(w->flight_entry, "notify::text", G_CALLBACK(on_filter_changed), ctx);
+    gtk_box_append(GTK_BOX(bar), ui_form_label("Flight"));
     gtk_box_append(GTK_BOX(bar), w->flight_entry);
     gtk_box_append(GTK_BOX(page), bar);
 
     w->count_label = gtk_label_new("");
+    gtk_widget_add_css_class(w->count_label, "status-line");
     gtk_widget_set_halign(w->count_label, GTK_ALIGN_START);
     gtk_box_append(GTK_BOX(page), w->count_label);
 
     w->grid = gtk_grid_new();
-    GtkWidget *scroll = gtk_scrolled_window_new();
-    gtk_widget_set_vexpand(scroll, TRUE);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), w->grid);
-    gtk_box_append(GTK_BOX(page), scroll);
+    gtk_box_append(GTK_BOX(page), ui_scroll_new(w->grid));
 
     page_eventlog_refresh(ctx);
     return page;

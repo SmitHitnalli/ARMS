@@ -1,28 +1,16 @@
 #include "page_history.h"
+#include "ui_common.h"
 
 static const char *const HEADERS[] = { "Flight ID", "Type", "Category", "Runway",
                                        "Request Tick", "Request Seq", "Completed Tick" };
 #define COLUMNS 7
-
-static void add_cell(GtkWidget *grid, int col, int row, const char *text, const char *css)
-{
-    GtkWidget *label = gtk_label_new(text);
-    gtk_widget_add_css_class(label, css);
-    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
-    gtk_widget_set_hexpand(label, TRUE);
-    gtk_grid_attach(GTK_GRID(grid), label, col, row, 1, 1);
-}
+#define NUMERIC (7u << 4)   /* Request Tick, Request Seq, Completed Tick */
 
 void page_history_refresh(AppCtx *ctx)
 {
     HistoryWidgets *w = &ctx->history_page;
-    GtkWidget *child;
 
-    while ((child = gtk_widget_get_first_child(w->grid)) != NULL)
-        gtk_grid_remove(GTK_GRID(w->grid), child);
-
-    for (int c = 0; c < COLUMNS; c++)
-        add_cell(w->grid, c, 0, HEADERS[c], "table-header");
+    ui_reset_grid(w->grid, HEADERS, COLUMNS, NUMERIC);
 
     /* Walk the nodes directly: history_at(i) would rescan from the head for every row. */
     int row = 1;
@@ -37,13 +25,10 @@ void page_history_refresh(AppCtx *ctx)
             m->runway_id, tick, seq, done
         };
         for (int c = 0; c < COLUMNS; c++)
-            add_cell(w->grid, c, row, cells[c], "table-cell");
+            ui_add_cell(w->grid, c, row, cells[c], "table-cell", (NUMERIC >> c) & 1u);
     }
-    if (row == 1) {
-        GtkWidget *empty = gtk_label_new("No completed movements yet");
-        gtk_widget_add_css_class(empty, "dim-label");
-        gtk_grid_attach(GTK_GRID(w->grid), empty, 0, 1, COLUMNS, 1);
-    }
+    if (row == 1)
+        ui_add_empty(w->grid, COLUMNS, "No completed movements yet");
 
     char count[48];
     snprintf(count, sizeof count, "Completed movements: %d", history_count(&ctx->sys.history));
@@ -53,23 +38,15 @@ void page_history_refresh(AppCtx *ctx)
 GtkWidget *page_history_new(AppCtx *ctx)
 {
     HistoryWidgets *w = &ctx->history_page;
-    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
-    gtk_widget_add_css_class(page, "page");
-
-    GtkWidget *heading = gtk_label_new("Movement History");
-    gtk_widget_add_css_class(heading, "page-title");
-    gtk_widget_set_halign(heading, GTK_ALIGN_START);
-    gtk_box_append(GTK_BOX(page), heading);
+    GtkWidget *page = ui_page_new("Movement History");
 
     w->count_label = gtk_label_new("");
+    gtk_widget_add_css_class(w->count_label, "status-line");
     gtk_widget_set_halign(w->count_label, GTK_ALIGN_START);
     gtk_box_append(GTK_BOX(page), w->count_label);
 
     w->grid = gtk_grid_new();
-    GtkWidget *scroll = gtk_scrolled_window_new();
-    gtk_widget_set_vexpand(scroll, TRUE);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), w->grid);
-    gtk_box_append(GTK_BOX(page), scroll);
+    gtk_box_append(GTK_BOX(page), ui_scroll_new(w->grid));
 
     page_history_refresh(ctx);
     return page;

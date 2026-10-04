@@ -1,16 +1,9 @@
 #include "page_holding.h"
+#include "ui_common.h"
 
 static const char *const HEADERS[] = { "ID", "Type", "Emergency", "Fuel", "Request Seq", "Action" };
 #define COLUMNS 6
-
-static void add_cell(GtkWidget *grid, int col, int row, const char *text, const char *css)
-{
-    GtkWidget *label = gtk_label_new(text);
-    gtk_widget_add_css_class(label, css);
-    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
-    gtk_widget_set_hexpand(label, TRUE);
-    gtk_grid_attach(GTK_GRID(grid), label, col, row, 1, 1);
-}
+#define NUMERIC (1u << 4)   /* Request Seq */
 
 /* Shows the core error, or refreshes every page and shows ok_msg. */
 static void finish(AppCtx *ctx, ArmsStatus st, const char *ok_msg)
@@ -100,11 +93,7 @@ static void fill_dev_label(AppCtx *ctx)
 void page_holding_refresh(AppCtx *ctx)
 {
     GtkWidget *grid = ctx->holding_page.grid;
-    GtkWidget *child;
-    while ((child = gtk_widget_get_first_child(grid)) != NULL)
-        gtk_grid_remove(GTK_GRID(grid), child);
-    for (int c = 0; c < COLUMNS; c++)
-        add_cell(grid, c, 0, HEADERS[c], "table-header");
+    ui_reset_grid(grid, HEADERS, COLUMNS, NUMERIC);
 
     const CircularQueue *q = &ctx->sys.holding.queue;
     int row = 1;
@@ -119,7 +108,7 @@ void page_holding_refresh(AppCtx *ctx)
             flight_fuel_name(f->fuel), seq
         };
         for (int c = 0; c < COLUMNS - 1; c++)
-            add_cell(grid, c, row, cells[c], "table-cell");
+            ui_add_cell(grid, c, row, cells[c], "table-cell", (NUMERIC >> c) & 1u);
 
         GtkWidget *leave = gtk_button_new_with_label("Leave");
         gtk_widget_set_halign(leave, GTK_ALIGN_START);
@@ -128,12 +117,8 @@ void page_holding_refresh(AppCtx *ctx)
         gtk_grid_attach(GTK_GRID(grid), leave, COLUMNS - 1, row, 1, 1);
         row++;
     }
-    if (row == 1) {
-        GtkWidget *empty = gtk_label_new("Holding queue is empty");
-        gtk_widget_add_css_class(empty, "dim-label");
-        gtk_widget_set_halign(empty, GTK_ALIGN_START);
-        gtk_grid_attach(GTK_GRID(grid), empty, 0, 1, COLUMNS, 1);
-    }
+    if (row == 1)
+        ui_add_empty(grid, COLUMNS, "No flights in holding");
 
     fill_enter_dropdown(ctx);
     fill_dev_label(ctx);
@@ -142,37 +127,26 @@ void page_holding_refresh(AppCtx *ctx)
 GtkWidget *page_holding_new(AppCtx *ctx)
 {
     HoldingWidgets *w = &ctx->holding_page;
-    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
-    gtk_widget_add_css_class(page, "page");
+    GtkWidget *page = ui_page_new("Holding");
 
-    GtkWidget *heading = gtk_label_new("Holding");
-    gtk_widget_add_css_class(heading, "page-title");
-    gtk_widget_set_halign(heading, GTK_ALIGN_START);
-    gtk_box_append(GTK_BOX(page), heading);
-
-    GtkWidget *form = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_widget_add_css_class(form, "form-row");
+    gtk_box_append(GTK_BOX(page), ui_section_title("Hold a waiting flight"));
+    GtkWidget *form = ui_form_row();
     w->enter_dd = gtk_drop_down_new(NULL, NULL);
-    GtkWidget *enter = gtk_button_new_with_label("Enter Holding");
-    g_signal_connect(enter, "clicked", G_CALLBACK(on_enter_clicked), ctx);
+    gtk_box_append(GTK_BOX(form), ui_form_label("Flight"));
     gtk_box_append(GTK_BOX(form), w->enter_dd);
-    gtk_box_append(GTK_BOX(form), enter);
+    gtk_box_append(GTK_BOX(form), ui_button("Enter Holding", G_CALLBACK(on_enter_clicked), ctx));
     gtk_box_append(GTK_BOX(page), form);
 
+    gtk_box_append(GTK_BOX(page), ui_section_title("Holding queue"));
     w->grid = gtk_grid_new();
-    GtkWidget *scroll = gtk_scrolled_window_new();
-    gtk_widget_set_vexpand(scroll, TRUE);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), w->grid);
-    gtk_box_append(GTK_BOX(page), scroll);
+    gtk_box_append(GTK_BOX(page), ui_scroll_new(w->grid));
 
-    GtkWidget *dev = gtk_expander_new("Developer: circular queue");
     w->dev_label = gtk_label_new("");
     gtk_label_set_xalign(GTK_LABEL(w->dev_label), 0.0f);
     gtk_label_set_selectable(GTK_LABEL(w->dev_label), TRUE);
     gtk_widget_add_css_class(w->dev_label, "monospace");
     gtk_label_set_wrap(GTK_LABEL(w->dev_label), TRUE);
-    gtk_expander_set_child(GTK_EXPANDER(dev), w->dev_label);
-    gtk_box_append(GTK_BOX(page), dev);
+    gtk_box_append(GTK_BOX(page), ui_dev_section("Developer: circular queue", w->dev_label));
 
     page_holding_refresh(ctx);
     return page;

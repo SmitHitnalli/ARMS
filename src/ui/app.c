@@ -86,8 +86,14 @@ static GtkWidget *notice_new(AppCtx *ctx)
     gtk_widget_set_hexpand(ctx->notice_label, TRUE);
     gtk_widget_set_halign(ctx->notice_label, GTK_ALIGN_START);
     gtk_label_set_wrap(GTK_LABEL(ctx->notice_label), TRUE);
+    gtk_label_set_wrap_mode(GTK_LABEL(ctx->notice_label), PANGO_WRAP_WORD_CHAR);
+    gtk_label_set_max_width_chars(GTK_LABEL(ctx->notice_label), 100);
 
-    GtkWidget *dismiss = gtk_button_new_with_label("Dismiss");
+    GtkWidget *dismiss = gtk_button_new_with_label("\u00d7");
+    gtk_widget_add_css_class(dismiss, "flat");
+    gtk_widget_add_css_class(dismiss, "notice-dismiss");
+    gtk_widget_set_valign(dismiss, GTK_ALIGN_CENTER);
+    gtk_widget_set_tooltip_text(dismiss, "Dismiss");
     g_signal_connect(dismiss, "clicked", G_CALLBACK(on_notice_dismiss), ctx);
 
     gtk_box_append(GTK_BOX(ctx->notice_box), ctx->notice_label);
@@ -331,13 +337,17 @@ void app_activate(GtkApplication *app, gpointer user_data)
     ctx->window = GTK_WINDOW(gtk_application_window_new(app));
     gtk_window_set_title(ctx->window, "ARMS - Airport Runway Management System");
     gtk_window_set_default_size(ctx->window, 1100, 700);
+    gtk_widget_set_size_request(GTK_WIDGET(ctx->window), 900, 600);   /* minimum size */
     load_css();
 
     GtkWidget *header = gtk_header_bar_new();
     GtkWidget *save = gtk_button_new_with_label("Save");
+    gtk_widget_add_css_class(save, "suggested-action");
+    gtk_widget_set_tooltip_text(save, "Save all data to the save file");
     g_signal_connect(save, "clicked", G_CALLBACK(on_save_clicked), ctx);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(header), save);
     GtkWidget *demo = gtk_button_new_with_label("Load Demo");
+    gtk_widget_set_tooltip_text(demo, "Replace the current data with a sample scenario (not saved until you Save)");
     g_signal_connect(demo, "clicked", G_CALLBACK(on_demo_clicked), ctx);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(header), demo);
     gtk_window_set_titlebar(ctx->window, header);

@@ -1,16 +1,9 @@
 #include "page_graph.h"
+#include "ui_common.h"
 
 static const char *const HEADERS[] = { "Index", "ID", "Label", "Connected To" };
 #define COLUMNS 4
-
-static void add_cell(GtkWidget *grid, int col, int row, const char *text, const char *css)
-{
-    GtkWidget *label = gtk_label_new(text);
-    gtk_widget_add_css_class(label, css);
-    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
-    gtk_widget_set_hexpand(label, TRUE);
-    gtk_grid_attach(GTK_GRID(grid), label, col, row, 1, 1);
-}
+#define NUMERIC 1u   /* Index */
 
 /* Appends "ID" or "ID (Label)" (label omitted when empty). */
 static void append_node(GString *s, const GraphNode *n)
@@ -77,13 +70,8 @@ void page_graph_refresh(AppCtx *ctx)
 {
     GraphWidgets *w = &ctx->graph_page;
     const AirportGraph *g = &ctx->sys.graph;
-    GtkWidget *child;
 
-    while ((child = gtk_widget_get_first_child(w->nodes_grid)) != NULL)
-        gtk_grid_remove(GTK_GRID(w->nodes_grid), child);
-
-    for (int c = 0; c < COLUMNS; c++)
-        add_cell(w->nodes_grid, c, 0, HEADERS[c], "table-header");
+    ui_reset_grid(w->nodes_grid, HEADERS, COLUMNS, NUMERIC);
 
     int n = graph_node_count(g);
     for (int i = 0; i < n; i++) {
@@ -103,14 +91,11 @@ void page_graph_refresh(AppCtx *ctx)
         const char *cells[COLUMNS] = { index, a->id, a->label[0] != '\0' ? a->label : "-",
                                        links->len > 0 ? links->str : "-" };
         for (int c = 0; c < COLUMNS; c++)
-            add_cell(w->nodes_grid, c, i + 1, cells[c], "table-cell");
+            ui_add_cell(w->nodes_grid, c, i + 1, cells[c], "table-cell", (NUMERIC >> c) & 1u);
         g_string_free(links, TRUE);
     }
-    if (n == 0) {
-        GtkWidget *empty = gtk_label_new("No nodes yet");
-        gtk_widget_add_css_class(empty, "dim-label");
-        gtk_grid_attach(GTK_GRID(w->nodes_grid), empty, 0, 1, COLUMNS, 1);
-    }
+    if (n == 0)
+        ui_add_empty(w->nodes_grid, COLUMNS, "No nodes yet");
 
     fill_dropdown(w->edge_a_dd, g);
     fill_dropdown(w->edge_b_dd, g);
@@ -220,28 +205,6 @@ static void on_reach(GtkButton *button, gpointer user_data)
     gtk_label_set_text(GTK_LABEL(w->reach_label), msg);
 }
 
-static GtkWidget *section_title(const char *text)
-{
-    GtkWidget *label = gtk_label_new(text);
-    gtk_widget_add_css_class(label, "card-title");
-    gtk_widget_set_halign(label, GTK_ALIGN_START);
-    return label;
-}
-
-static GtkWidget *form_row(void)
-{
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_widget_add_css_class(row, "form-row");
-    return row;
-}
-
-static GtkWidget *button_new(const char *text, GCallback cb, AppCtx *ctx)
-{
-    GtkWidget *b = gtk_button_new_with_label(text);
-    g_signal_connect(b, "clicked", cb, ctx);
-    return b;
-}
-
 static GtkWidget *result_label(void)
 {
     GtkWidget *label = gtk_label_new("");
@@ -254,48 +217,48 @@ static GtkWidget *result_label(void)
 GtkWidget *page_graph_new(AppCtx *ctx)
 {
     GraphWidgets *w = &ctx->graph_page;
-    GtkWidget *content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_widget_add_css_class(content, "page");
-
-    GtkWidget *heading = gtk_label_new("Airport Graph");
-    gtk_widget_add_css_class(heading, "page-title");
-    gtk_widget_set_halign(heading, GTK_ALIGN_START);
-    gtk_box_append(GTK_BOX(content), heading);
+    GtkWidget *content = ui_page_new("Airport Graph");
 
     /* edit */
-    GtkWidget *node_form = form_row();
+    gtk_box_append(GTK_BOX(content), ui_section_title("Add node"));
+    GtkWidget *node_form = ui_form_row();
     w->id_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(w->id_entry), "Node ID");
     w->label_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(w->label_entry), "Label (optional)");
-    GtkWidget *add_node = button_new("Add Node", G_CALLBACK(on_add_node), ctx);
+    GtkWidget *add_node = ui_button("Add Node", G_CALLBACK(on_add_node), ctx);
     g_signal_connect_swapped(w->label_entry, "activate", G_CALLBACK(gtk_widget_activate), add_node);
+    gtk_box_append(GTK_BOX(node_form), ui_form_label("Node ID"));
     gtk_box_append(GTK_BOX(node_form), w->id_entry);
+    gtk_box_append(GTK_BOX(node_form), ui_form_label("Label"));
     gtk_box_append(GTK_BOX(node_form), w->label_entry);
     gtk_box_append(GTK_BOX(node_form), add_node);
     gtk_box_append(GTK_BOX(content), node_form);
 
-    GtkWidget *edge_form = form_row();
+    gtk_box_append(GTK_BOX(content), ui_section_title("Add connection"));
+    GtkWidget *edge_form = ui_form_row();
     w->edge_a_dd = gtk_drop_down_new(NULL, NULL);
     w->edge_b_dd = gtk_drop_down_new(NULL, NULL);
+    gtk_box_append(GTK_BOX(edge_form), ui_form_label("Between"));
     gtk_box_append(GTK_BOX(edge_form), w->edge_a_dd);
-    gtk_box_append(GTK_BOX(edge_form), gtk_label_new("-"));
+    gtk_box_append(GTK_BOX(edge_form), ui_form_label("and"));
     gtk_box_append(GTK_BOX(edge_form), w->edge_b_dd);
-    gtk_box_append(GTK_BOX(edge_form), button_new("Add Edge", G_CALLBACK(on_add_edge), ctx));
+    gtk_box_append(GTK_BOX(edge_form), ui_button("Add Edge", G_CALLBACK(on_add_edge), ctx));
     gtk_box_append(GTK_BOX(content), edge_form);
 
     /* nodes and connections */
+    gtk_box_append(GTK_BOX(content), ui_section_title("Nodes and connections"));
     w->nodes_grid = gtk_grid_new();
     gtk_box_append(GTK_BOX(content), w->nodes_grid);
 
     /* traversal */
-    gtk_box_append(GTK_BOX(content), section_title("Traversal"));
-    GtkWidget *trav_form = form_row();
+    gtk_box_append(GTK_BOX(content), ui_section_title("Traversal"));
+    GtkWidget *trav_form = ui_form_row();
     w->trav_dd = gtk_drop_down_new(NULL, NULL);
-    GtkWidget *bfs = button_new("BFS", G_CALLBACK(on_traverse), ctx);
-    GtkWidget *dfs = button_new("DFS", G_CALLBACK(on_traverse), ctx);
+    GtkWidget *bfs = ui_button("BFS", G_CALLBACK(on_traverse), ctx);
+    GtkWidget *dfs = ui_button("DFS", G_CALLBACK(on_traverse), ctx);
     g_object_set_data(G_OBJECT(dfs), "dfs", GINT_TO_POINTER(1));
-    gtk_box_append(GTK_BOX(trav_form), gtk_label_new("Start:"));
+    gtk_box_append(GTK_BOX(trav_form), ui_form_label("Start node"));
     gtk_box_append(GTK_BOX(trav_form), w->trav_dd);
     gtk_box_append(GTK_BOX(trav_form), bfs);
     gtk_box_append(GTK_BOX(trav_form), dfs);
@@ -304,33 +267,28 @@ GtkWidget *page_graph_new(AppCtx *ctx)
     gtk_box_append(GTK_BOX(content), w->trav_label);
 
     /* reachability */
-    gtk_box_append(GTK_BOX(content), section_title("Reachability"));
-    GtkWidget *reach_form = form_row();
+    gtk_box_append(GTK_BOX(content), ui_section_title("Reachability"));
+    GtkWidget *reach_form = ui_form_row();
     w->reach_from_dd = gtk_drop_down_new(NULL, NULL);
     w->reach_to_dd = gtk_drop_down_new(NULL, NULL);
-    gtk_box_append(GTK_BOX(reach_form), gtk_label_new("From:"));
+    gtk_box_append(GTK_BOX(reach_form), ui_form_label("From"));
     gtk_box_append(GTK_BOX(reach_form), w->reach_from_dd);
-    gtk_box_append(GTK_BOX(reach_form), gtk_label_new("To:"));
+    gtk_box_append(GTK_BOX(reach_form), ui_form_label("To"));
     gtk_box_append(GTK_BOX(reach_form), w->reach_to_dd);
     gtk_box_append(GTK_BOX(reach_form),
-                   button_new("Check Reachability", G_CALLBACK(on_reach), ctx));
+                   ui_button("Check Reachability", G_CALLBACK(on_reach), ctx));
     gtk_box_append(GTK_BOX(content), reach_form);
     w->reach_label = result_label();
     gtk_box_append(GTK_BOX(content), w->reach_label);
 
     /* developer view */
-    GtkWidget *dev = gtk_expander_new("Developer: adjacency matrix");
     w->matrix_label = gtk_label_new("");
     gtk_label_set_xalign(GTK_LABEL(w->matrix_label), 0.0f);
     gtk_label_set_selectable(GTK_LABEL(w->matrix_label), TRUE);
     gtk_widget_add_css_class(w->matrix_label, "monospace");
-    gtk_expander_set_child(GTK_EXPANDER(dev), w->matrix_label);
-    gtk_box_append(GTK_BOX(content), dev);
-
-    GtkWidget *scroll = gtk_scrolled_window_new();
-    gtk_widget_set_vexpand(scroll, TRUE);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), content);
+    gtk_box_append(GTK_BOX(content),
+                   ui_dev_section("Developer: adjacency matrix", w->matrix_label));
 
     page_graph_refresh(ctx);
-    return scroll;
+    return ui_scroll_new(content);
 }

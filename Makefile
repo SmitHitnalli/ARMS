@@ -12,7 +12,7 @@ CORE    = src/common.c src/flight.c src/runway.c src/queue.c src/request.c src/c
 HEADERS = $(wildcard include/*.h src/ui/*.h)
 
 # GTK frontend: calls the core API, never the other way round. Linked into the app only.
-UI      = src/ui/app.c src/ui/page_dashboard.c src/ui/page_flights.c src/ui/page_runways.c src/ui/page_scheduler.c src/ui/page_holding.c src/ui/page_history.c src/ui/page_graph.c src/ui/page_reports.c src/ui/page_eventlog.c
+UI      = src/ui/app.c src/ui/ui_common.c src/ui/page_dashboard.c src/ui/page_flights.c src/ui/page_runways.c src/ui/page_scheduler.c src/ui/page_holding.c src/ui/page_history.c src/ui/page_graph.c src/ui/page_reports.c src/ui/page_eventlog.c
 
 all: $(TARGET)
 

@@ -1,4 +1,5 @@
 #include "page_dashboard.h"
+#include "ui_common.h"
 
 /* One summary card: a small title above a big value. Returns the value label. */
 static GtkWidget *add_card(GtkWidget *row, const char *title)
@@ -49,17 +50,16 @@ void page_dashboard_refresh(AppCtx *ctx)
     set_number(ctx->dashboard.waiting, waiting);
     set_number(ctx->dashboard.emergencies, emergencies);
     set_number(ctx->dashboard.runways, available);
+
+    if (emergencies > 0)
+        gtk_widget_add_css_class(ctx->dashboard.emergencies, "card-value-alert");
+    else
+        gtk_widget_remove_css_class(ctx->dashboard.emergencies, "card-value-alert");
 }
 
 GtkWidget *page_dashboard_new(AppCtx *ctx)
 {
-    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
-    gtk_widget_add_css_class(page, "page");
-
-    GtkWidget *heading = gtk_label_new("Dashboard");
-    gtk_widget_add_css_class(heading, "page-title");
-    gtk_widget_set_halign(heading, GTK_ALIGN_START);
-    gtk_box_append(GTK_BOX(page), heading);
+    GtkWidget *page = ui_page_new("Dashboard");
 
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
     gtk_box_set_homogeneous(GTK_BOX(row), TRUE);

@@ -1,19 +1,38 @@
-.sidebar { background: #f3f4f6; }
+/* Theme-safe: colours come from the GTK theme (named colours, currentColor), so light and dark both work. */
+
+/* ---- sidebar ---- */
+.sidebar { background: alpha(currentColor, 0.04); }
 .sidebar-item { padding: 10px 16px; }
-.sidebar row:selected { background: #1f4e79; }
-.sidebar row:selected .sidebar-item { color: #ffffff; }
+.sidebar row:hover { background: alpha(currentColor, 0.08); }
+.sidebar row:selected { background: @theme_selected_bg_color; }
+.sidebar row:selected .sidebar-item { color: @theme_selected_fg_color; font-weight: bold; }
 
+/* ---- page layout ---- */
 .page { padding: 24px; }
-.page-title { font-size: 22px; font-weight: bold; }
+.page-title { font-size: 22px; font-weight: bold; margin-bottom: 4px; }
+.section-title { font-size: 15px; font-weight: bold; margin-top: 12px; }
+.status-line { opacity: 0.75; }
 
-.card { padding: 16px; border: 1px solid #d1d5db; border-radius: 8px; background: #ffffff; }
-.card-title { color: #6b7280; }
-.card-value { font-size: 32px; font-weight: bold; color: #1f4e79; }
+/* ---- dashboard cards ---- */
+.card { padding: 16px 20px; border: 1px solid alpha(currentColor, 0.18); border-radius: 8px; background: alpha(currentColor, 0.04); }
+.card-title { opacity: 0.7; }
+.card-value { font-size: 34px; font-weight: bold; color: @theme_selected_bg_color; }
+.card-value-alert { color: @error_color; }
 
+/* ---- forms ---- */
 .form-row { margin-bottom: 4px; }
-.table-header { font-weight: bold; color: #ffffff; background: #1f4e79; padding: 6px 12px; }
-.table-cell { padding: 6px 12px; border-bottom: 1px solid #e5e7eb; }
+.form-label { opacity: 0.75; }
 
-.notice { padding: 8px 16px; }
-.notice-success { background: #dcfce7; color: #166534; }
-.notice-error { background: #fee2e2; color: #991b1b; }
+/* ---- tables ---- */
+.table-header { font-weight: bold; color: @theme_selected_fg_color; background: @theme_selected_bg_color; padding: 6px 12px; }
+.table-cell { padding: 6px 12px; border-bottom: 1px solid alpha(currentColor, 0.12); }
+.empty-state { padding: 12px; }
+
+/* ---- developer / DSA views ---- */
+.dev-section { margin-top: 16px; padding-top: 8px; border-top: 1px dashed alpha(currentColor, 0.3); opacity: 0.8; }
+
+/* ---- notifications ---- */
+.notice { padding: 8px 16px; border-left: 4px solid transparent; border-bottom: 1px solid alpha(currentColor, 0.15); }
+.notice-success { background: alpha(@success_color, 0.18); border-left-color: @success_color; }
+.notice-error { background: alpha(@error_color, 0.18); border-left-color: @error_color; }
+.notice-dismiss { min-width: 24px; min-height: 24px; padding: 0 6px; font-size: 18px; }

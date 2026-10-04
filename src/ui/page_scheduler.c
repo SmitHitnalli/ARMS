@@ -1,9 +1,11 @@
 #include "page_scheduler.h"
 #include "operations.h"
 #include "reports.h"
+#include "ui_common.h"
 
 static const char *const FLIGHT_HEADERS[] = { "ID", "Type", "Emergency", "Fuel", "Request Seq" };
 #define FLIGHT_COLS 5
+#define FLIGHT_NUMERIC (1u << 4)   /* Request Seq */
 static const char *const HEAP_HEADERS[] = { "#", "ID", "Type", "Emergency", "Fuel", "Request Seq" };
 static const char *const RAW_HEADERS[]  = { "Index", "Flight ID", "Parent Index" };
 static const char *const OPS_HEADERS[]  = { "ID", "Type", "State", "Runway", "Actions" };
@@ -13,33 +15,6 @@ static const char *const FUEL_CHOICES[]      = { "NORMAL", "LOW", "CRITICAL", NU
 typedef enum { ACT_START, ACT_COMPLETE, ACT_CANCEL } RowAction;
 
 /* ---- small widget helpers ---- */
-
-static void add_cell(GtkWidget *grid, int col, int row, const char *text, const char *css)
-{
-    GtkWidget *label = gtk_label_new(text);
-    gtk_widget_add_css_class(label, css);
-    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
-    gtk_widget_set_hexpand(label, TRUE);
-    gtk_grid_attach(GTK_GRID(grid), label, col, row, 1, 1);
-}
-
-/* Empties the grid and writes the header row. */
-static void reset_grid(GtkWidget *grid, const char *const *headers, int cols)
-{
-    GtkWidget *child;
-    while ((child = gtk_widget_get_first_child(grid)) != NULL)
-        gtk_grid_remove(GTK_GRID(grid), child);
-    for (int c = 0; c < cols; c++)
-        add_cell(grid, c, 0, headers[c], "table-header");
-}
-
-static void add_empty_row(GtkWidget *grid, int cols, const char *text)
-{
-    GtkWidget *empty = gtk_label_new(text);
-    gtk_widget_add_css_class(empty, "dim-label");
-    gtk_widget_set_halign(empty, GTK_ALIGN_START);
-    gtk_grid_attach(GTK_GRID(grid), empty, 0, 1, cols, 1);
-}
 
 /* ID, Type, Emergency, Fuel, Request Seq starting at column col0. */
 static void add_flight_cells(GtkWidget *grid, int col0, int row, const Flight *f)
@@ -51,21 +26,7 @@ static void add_flight_cells(GtkWidget *grid, int col0, int row, const Flight *f
         flight_fuel_name(f->fuel), seq
     };
     for (int c = 0; c < FLIGHT_COLS; c++)
-        add_cell(grid, col0 + c, row, cells[c], "table-cell");
-}
-
-static GtkWidget *section_title(const char *text)
-{
-    GtkWidget *label = gtk_label_new(text);
-    gtk_widget_add_css_class(label, "title-4");
-    gtk_widget_set_halign(label, GTK_ALIGN_START);
-    return label;
-}
-
-static GtkWidget *grid_in_box(GtkWidget *parent_box, GtkWidget *grid)
-{
-    gtk_box_append(GTK_BOX(parent_box), grid);
-    return grid;
+        ui_add_cell(grid, col0 + c, row, cells[c], "table-cell", (FLIGHT_NUMERIC >> c) & 1u);
 }
 
 /* ---- flight dropdowns ---- */
@@ -239,7 +200,7 @@ static GtkWidget *action_button(AppCtx *ctx, const char *label, const char *id, 
 
 static void fill_queue_grid(AppCtx *ctx, GtkWidget *grid, const Queue *q)
 {
-    reset_grid(grid, FLIGHT_HEADERS, FLIGHT_COLS);
+    ui_reset_grid(grid, FLIGHT_HEADERS, FLIGHT_COLS, FLIGHT_NUMERIC);
     int n = queue_count(q);
     int row = 1;
     for (int i = 0; i < n; i++) {
@@ -248,14 +209,14 @@ static void fill_queue_grid(AppCtx *ctx, GtkWidget *grid, const Queue *q)
             add_flight_cells(grid, 0, row++, f);
     }
     if (n == 0)
-        add_empty_row(grid, FLIGHT_COLS, "Empty");
+        ui_add_empty(grid, FLIGHT_COLS, "No flights in this queue");
 }
 
 /* Priority preview: report_flights_sorted orders a pointer array only, so the heap and
  * the FlightStore are never touched. Heap members are picked out by scheduler_contains. */
 static void fill_heap_grid(AppCtx *ctx, GtkWidget *grid)
 {
-    reset_grid(grid, HEAP_HEADERS, FLIGHT_COLS + 1);
+    ui_reset_grid(grid, HEAP_HEADERS, FLIGHT_COLS + 1, 1u | (1u << 5));
     const Flight *sorted[MAX_FLIGHTS];
     int n = 0, rank = 0;
     if (report_flights_sorted(&ctx->sys.flights, FLIGHT_SORT_PRIORITY, 1,
@@ -265,33 +226,33 @@ static void fill_heap_grid(AppCtx *ctx, GtkWidget *grid)
                 continue;
             char num[16];
             snprintf(num, sizeof num, "%d", ++rank);
-            add_cell(grid, 0, rank, num, "table-cell");
+            ui_add_cell(grid, 0, rank, num, "table-cell", 1);
             add_flight_cells(grid, 1, rank, sorted[i]);
         }
     }
     if (rank == 0)
-        add_empty_row(grid, FLIGHT_COLS + 1, "Heap is empty. Use Pull Waiting Flights.");
+        ui_add_empty(grid, FLIGHT_COLS + 1, "No flights in the heap. Use Pull Waiting Flights.");
 }
 
 static void fill_raw_grid(AppCtx *ctx, GtkWidget *grid)
 {
-    reset_grid(grid, RAW_HEADERS, 3);
+    ui_reset_grid(grid, RAW_HEADERS, 3, 1u | (1u << 2));
     const MaxHeap *h = &ctx->sys.scheduler.heap;
     for (int i = 0; i < h->count; i++) {
         char idx[16], parent[16];
         snprintf(idx, sizeof idx, "%d", i);
         snprintf(parent, sizeof parent, "%d", (i - 1) / 2);
-        add_cell(grid, 0, i + 1, idx, "table-cell");
-        add_cell(grid, 1, i + 1, h->ids[i], "table-cell");
-        add_cell(grid, 2, i + 1, i == 0 ? "-" : parent, "table-cell");
+        ui_add_cell(grid, 0, i + 1, idx, "table-cell", 1);
+        ui_add_cell(grid, 1, i + 1, h->ids[i], "table-cell", 0);
+        ui_add_cell(grid, 2, i + 1, i == 0 ? "-" : parent, "table-cell", 1);
     }
     if (h->count == 0)
-        add_empty_row(grid, 3, "Empty");
+        ui_add_empty(grid, 3, "The heap is empty");
 }
 
 static void fill_ops_grid(AppCtx *ctx, GtkWidget *grid)
 {
-    reset_grid(grid, OPS_HEADERS, 5);
+    ui_reset_grid(grid, OPS_HEADERS, 5, 0);
     int row = 1;
     for (int i = 0; i < flight_count(&ctx->sys.flights); i++) {
         const Flight *f = flight_at(&ctx->sys.flights, i);
@@ -300,7 +261,7 @@ static void fill_ops_grid(AppCtx *ctx, GtkWidget *grid)
         const char *cells[4] = { f->id, flight_type_name(f->type), flight_state_name(f->state),
                                  f->runway_id[0] != '\0' ? f->runway_id : "-" };
         for (int c = 0; c < 4; c++)
-            add_cell(grid, c, row, cells[c], "table-cell");
+            ui_add_cell(grid, c, row, cells[c], "table-cell", 0);
 
         GtkWidget *actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
         if (f->state == STATE_SCHEDULED)
@@ -313,7 +274,7 @@ static void fill_ops_grid(AppCtx *ctx, GtkWidget *grid)
         row++;
     }
     if (row == 1)
-        add_empty_row(grid, 5, "No active flights");
+        ui_add_empty(grid, 5, "No active flights");
 }
 
 void page_scheduler_refresh(AppCtx *ctx)
@@ -330,82 +291,68 @@ void page_scheduler_refresh(AppCtx *ctx)
 
 /* ---- construction ---- */
 
-static GtkWidget *row_box(void)
-{
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_widget_add_css_class(row, "form-row");
-    return row;
-}
-
-static GtkWidget *button_new(const char *label, GCallback cb, AppCtx *ctx)
-{
-    GtkWidget *b = gtk_button_new_with_label(label);
-    g_signal_connect(b, "clicked", cb, ctx);
-    return b;
-}
-
 GtkWidget *page_scheduler_new(AppCtx *ctx)
 {
     SchedulerWidgets *w = &ctx->scheduler_page;
-    GtkWidget *content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_widget_add_css_class(content, "page");
-
-    GtkWidget *heading = gtk_label_new("Scheduler");
-    gtk_widget_add_css_class(heading, "page-title");
-    gtk_widget_set_halign(heading, GTK_ALIGN_START);
-    gtk_box_append(GTK_BOX(content), heading);
+    GtkWidget *content = ui_page_new("Scheduler");
 
     /* Request submission */
-    gtk_box_append(GTK_BOX(content), section_title("Request runway service"));
-    GtkWidget *row = row_box();
+    gtk_box_append(GTK_BOX(content), ui_section_title("Request runway service"));
+    GtkWidget *row = ui_form_row();
     w->submit_dd = gtk_drop_down_new(NULL, NULL);
+    gtk_box_append(GTK_BOX(row), ui_form_label("Registered flight"));
     gtk_box_append(GTK_BOX(row), w->submit_dd);
-    gtk_box_append(GTK_BOX(row), button_new("Submit Request", G_CALLBACK(on_submit_clicked), ctx));
+    gtk_box_append(GTK_BOX(row), ui_button("Submit Request", G_CALLBACK(on_submit_clicked), ctx));
     gtk_box_append(GTK_BOX(content), row);
 
     /* Normal queues */
-    gtk_box_append(GTK_BOX(content), section_title("Landing queue (FIFO)"));
-    w->landing_grid = grid_in_box(content, gtk_grid_new());
-    gtk_box_append(GTK_BOX(content), section_title("Takeoff queue (FIFO)"));
-    w->takeoff_grid = grid_in_box(content, gtk_grid_new());
+    gtk_box_append(GTK_BOX(content), ui_section_title("Landing queue (FIFO)"));
+    w->landing_grid = gtk_grid_new();
+    gtk_box_append(GTK_BOX(content), w->landing_grid);
+    gtk_box_append(GTK_BOX(content), ui_section_title("Takeoff queue (FIFO)"));
+    w->takeoff_grid = gtk_grid_new();
+    gtk_box_append(GTK_BOX(content), w->takeoff_grid);
 
     /* Heap */
-    gtk_box_append(GTK_BOX(content), section_title("Priority heap (most urgent first)"));
-    row = row_box();
+    gtk_box_append(GTK_BOX(content), ui_section_title("Priority heap (most urgent first)"));
+    row = ui_form_row();
     gtk_box_append(GTK_BOX(row),
-                   button_new("Pull Waiting Flights", G_CALLBACK(on_pull_clicked), ctx));
+                   ui_button("Pull Waiting Flights", G_CALLBACK(on_pull_clicked), ctx));
     gtk_box_append(GTK_BOX(row),
-                   button_new("Schedule Next", G_CALLBACK(on_schedule_clicked), ctx));
+                   ui_button("Schedule Next", G_CALLBACK(on_schedule_clicked), ctx));
     gtk_box_append(GTK_BOX(content), row);
-    w->heap_grid = grid_in_box(content, gtk_grid_new());
+    w->heap_grid = gtk_grid_new();
+    gtk_box_append(GTK_BOX(content), w->heap_grid);
 
-    GtkWidget *dev = gtk_expander_new("Developer: raw heap array");
-    w->raw_grid = gtk_grid_new();
-    gtk_expander_set_child(GTK_EXPANDER(dev), w->raw_grid);
-    gtk_box_append(GTK_BOX(content), dev);
-
-    /* Priority controls */
-    gtk_box_append(GTK_BOX(content), section_title("Emergency and fuel"));
-    row = row_box();
+    /* Priority controls: two rows so the controls fit a narrow window */
+    gtk_box_append(GTK_BOX(content), ui_section_title("Emergency and fuel"));
+    row = ui_form_row();
     w->prio_dd = gtk_drop_down_new(NULL, NULL);
+    gtk_box_append(GTK_BOX(row), ui_form_label("Flight"));
+    gtk_box_append(GTK_BOX(row), w->prio_dd);
+    gtk_box_append(GTK_BOX(content), row);
+
+    row = ui_form_row();
     w->emergency_dd = gtk_drop_down_new_from_strings(EMERGENCY_CHOICES);
     w->fuel_dd = gtk_drop_down_new_from_strings(FUEL_CHOICES);
-    gtk_box_append(GTK_BOX(row), w->prio_dd);
+    gtk_box_append(GTK_BOX(row), ui_form_label("Emergency"));
     gtk_box_append(GTK_BOX(row), w->emergency_dd);
     gtk_box_append(GTK_BOX(row),
-                   button_new("Set Emergency", G_CALLBACK(on_emergency_clicked), ctx));
+                   ui_button("Set Emergency", G_CALLBACK(on_emergency_clicked), ctx));
+    gtk_box_append(GTK_BOX(row), ui_form_label("Fuel"));
     gtk_box_append(GTK_BOX(row), w->fuel_dd);
-    gtk_box_append(GTK_BOX(row), button_new("Set Fuel", G_CALLBACK(on_fuel_clicked), ctx));
+    gtk_box_append(GTK_BOX(row), ui_button("Set Fuel", G_CALLBACK(on_fuel_clicked), ctx));
     gtk_box_append(GTK_BOX(content), row);
 
     /* Operations */
-    gtk_box_append(GTK_BOX(content), section_title("Active flights"));
-    w->ops_grid = grid_in_box(content, gtk_grid_new());
+    gtk_box_append(GTK_BOX(content), ui_section_title("Active flights"));
+    w->ops_grid = gtk_grid_new();
+    gtk_box_append(GTK_BOX(content), w->ops_grid);
 
-    GtkWidget *scroll = gtk_scrolled_window_new();
-    gtk_widget_set_vexpand(scroll, TRUE);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), content);
+    /* Developer view last, so it stays out of the normal workflow */
+    w->raw_grid = gtk_grid_new();
+    gtk_box_append(GTK_BOX(content), ui_dev_section("Developer: raw heap array", w->raw_grid));
 
     page_scheduler_refresh(ctx);
-    return scroll;
+    return ui_scroll_new(content);
 }

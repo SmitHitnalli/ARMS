@@ -1,19 +1,11 @@
 #include "page_runways.h"
 #include "page_dashboard.h"
+#include "ui_common.h"
 
 static const char *const CATEGORY_CHOICES[] = { "SMALL", "MEDIUM", "LARGE", NULL };
 static const char *const HEADERS[] = { "Runway ID", "Status", "Max Category",
                                        "Current Flight", "Action" };
 #define COLUMNS 5
-
-static void add_cell(GtkWidget *grid, int col, int row, const char *text, const char *css)
-{
-    GtkWidget *label = gtk_label_new(text);
-    gtk_widget_add_css_class(label, css);
-    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
-    gtk_widget_set_hexpand(label, TRUE);
-    gtk_grid_attach(GTK_GRID(grid), label, col, row, 1, 1);
-}
 
 /* The button carries the runway ID and the status to set; the core validates the change. */
 static void on_status_clicked(GtkButton *button, gpointer user_data)
@@ -59,13 +51,8 @@ static GtkWidget *action_widget(AppCtx *ctx, const Runway *r)
 void page_runways_refresh(AppCtx *ctx)
 {
     GtkWidget *grid = ctx->runways_page.grid;
-    GtkWidget *child;
 
-    while ((child = gtk_widget_get_first_child(grid)) != NULL)
-        gtk_grid_remove(GTK_GRID(grid), child);
-
-    for (int c = 0; c < COLUMNS; c++)
-        add_cell(grid, c, 0, HEADERS[c], "table-header");
+    ui_reset_grid(grid, HEADERS, COLUMNS, 0);
 
     int n = runway_count(&ctx->sys.runways);
     for (int i = 0; i < n; i++) {
@@ -77,14 +64,11 @@ void page_runways_refresh(AppCtx *ctx)
             r->current_flight_id[0] != '\0' ? r->current_flight_id : "-"
         };
         for (int c = 0; c < COLUMNS - 1; c++)
-            add_cell(grid, c, i + 1, cells[c], "table-cell");
+            ui_add_cell(grid, c, i + 1, cells[c], "table-cell", 0);
         gtk_grid_attach(GTK_GRID(grid), action_widget(ctx, r), COLUMNS - 1, i + 1, 1, 1);
     }
-    if (n == 0) {
-        GtkWidget *empty = gtk_label_new("No runways yet");
-        gtk_widget_add_css_class(empty, "dim-label");
-        gtk_grid_attach(GTK_GRID(grid), empty, 0, 1, COLUMNS, 1);
-    }
+    if (n == 0)
+        ui_add_empty(grid, COLUMNS, "No runways yet");
 }
 
 static void on_add_clicked(GtkButton *button, gpointer user_data)
@@ -113,32 +97,25 @@ static void on_add_clicked(GtkButton *button, gpointer user_data)
 GtkWidget *page_runways_new(AppCtx *ctx)
 {
     RunwaysWidgets *w = &ctx->runways_page;
-    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
-    gtk_widget_add_css_class(page, "page");
+    GtkWidget *page = ui_page_new("Runways");
 
-    GtkWidget *heading = gtk_label_new("Runways");
-    gtk_widget_add_css_class(heading, "page-title");
-    gtk_widget_set_halign(heading, GTK_ALIGN_START);
-    gtk_box_append(GTK_BOX(page), heading);
-
-    GtkWidget *form = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_widget_add_css_class(form, "form-row");
+    gtk_box_append(GTK_BOX(page), ui_section_title("Add runway"));
+    GtkWidget *form = ui_form_row();
     w->id_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(w->id_entry), "Runway ID");
     w->category_dd = gtk_drop_down_new_from_strings(CATEGORY_CHOICES);
-    GtkWidget *add = gtk_button_new_with_label("Add Runway");
-    g_signal_connect(add, "clicked", G_CALLBACK(on_add_clicked), ctx);
+    GtkWidget *add = ui_button("Add Runway", G_CALLBACK(on_add_clicked), ctx);
     g_signal_connect_swapped(w->id_entry, "activate", G_CALLBACK(gtk_widget_activate), add);
+    gtk_box_append(GTK_BOX(form), ui_form_label("Runway ID"));
     gtk_box_append(GTK_BOX(form), w->id_entry);
+    gtk_box_append(GTK_BOX(form), ui_form_label("Max category"));
     gtk_box_append(GTK_BOX(form), w->category_dd);
     gtk_box_append(GTK_BOX(form), add);
     gtk_box_append(GTK_BOX(page), form);
 
+    gtk_box_append(GTK_BOX(page), ui_section_title("All runways"));
     w->grid = gtk_grid_new();
-    GtkWidget *scroll = gtk_scrolled_window_new();
-    gtk_widget_set_vexpand(scroll, TRUE);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), w->grid);
-    gtk_box_append(GTK_BOX(page), scroll);
+    gtk_box_append(GTK_BOX(page), ui_scroll_new(w->grid));
 
     page_runways_refresh(ctx);
     return page;
