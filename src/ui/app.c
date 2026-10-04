@@ -1,5 +1,7 @@
 #include "app.h"
 #include "page_dashboard.h"
+#include "page_flights.h"
+#include "page_runways.h"
 #include "page_placeholder.h"
 #include "persist.h"
 
@@ -134,6 +136,10 @@ static void on_row_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_d
     gtk_stack_set_visible_child_name(GTK_STACK(ctx->stack), PAGE_TITLE[page]);
     if (page == PAGE_DASHBOARD)
         page_dashboard_refresh(ctx);
+    else if (page == PAGE_FLIGHTS)
+        page_flights_refresh(ctx);
+    else if (page == PAGE_RUNWAYS)
+        page_runways_refresh(ctx);
 }
 
 static GtkWidget *build_pages(AppCtx *ctx)
@@ -143,9 +149,15 @@ static GtkWidget *build_pages(AppCtx *ctx)
     gtk_widget_set_vexpand(ctx->stack, TRUE);
 
     for (int i = 0; i < PAGE_COUNT; i++) {
-        GtkWidget *page = (i == PAGE_DASHBOARD)
-            ? page_dashboard_new(ctx)
-            : page_placeholder_new(PAGE_TITLE[i], PAGE_NOTE[i]);
+        GtkWidget *page;
+        if (i == PAGE_DASHBOARD)
+            page = page_dashboard_new(ctx);
+        else if (i == PAGE_FLIGHTS)
+            page = page_flights_new(ctx);
+        else if (i == PAGE_RUNWAYS)
+            page = page_runways_new(ctx);
+        else
+            page = page_placeholder_new(PAGE_TITLE[i], PAGE_NOTE[i]);
         gtk_stack_add_named(GTK_STACK(ctx->stack), page, PAGE_TITLE[i]);
     }
     return ctx->stack;
@@ -215,6 +227,8 @@ void app_activate(GtkApplication *app, gpointer user_data)
 
     load_on_startup(ctx);
     page_dashboard_refresh(ctx);
+    page_flights_refresh(ctx);
+    page_runways_refresh(ctx);
 
     g_signal_connect(ctx->window, "close-request", G_CALLBACK(on_close_request), ctx);
     gtk_list_box_select_row(GTK_LIST_BOX(ctx->sidebar),

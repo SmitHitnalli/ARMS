@@ -80,5 +80,7 @@ void        flight_list(FILE *out, const FlightStore *fs);
 const char *flight_state_name(FlightState s);
 const char *flight_type_name(FlightType t);
 const char *aircraft_category_name(AircraftCategory c);
+const char *flight_emergency_name(EmergencyLevel e);
+const char *flight_fuel_name(FuelLevel f);
 
 #endif

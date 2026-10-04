@@ -27,6 +27,21 @@ typedef struct {
     GtkWidget *runways;
 } DashboardWidgets;
 
+/* Flights page: the table grid and the inline Add form. */
+typedef struct {
+    GtkWidget *grid;
+    GtkWidget *id_entry;
+    GtkWidget *type_dd;
+    GtkWidget *category_dd;
+} FlightsWidgets;
+
+/* Runways page: the table grid and the inline Add form. */
+typedef struct {
+    GtkWidget *grid;
+    GtkWidget *id_entry;
+    GtkWidget *category_dd;
+} RunwaysWidgets;
+
 /* The whole application state. Lives on main()'s stack; no UI globals. */
 typedef struct {
     ArmsSystem       sys;
@@ -38,6 +53,8 @@ typedef struct {
     GtkWidget       *notice_box;
     GtkWidget       *notice_label;
     DashboardWidgets dashboard;
+    FlightsWidgets   flights_page;
+    RunwaysWidgets   runways_page;
     char             save_path[260];
     int              load_failed;   /* 1 = a save exists but could not be loaded: never overwrite it */
 } AppCtx;

@@ -206,6 +206,25 @@ const char *flight_type_name(FlightType t)
     }
 }
 
+const char *flight_emergency_name(EmergencyLevel e)
+{
+    switch (e) {
+    case EMERGENCY_NONE:   return "NONE";
+    case EMERGENCY_ACTIVE: return "ACTIVE";
+    default:               return "UNKNOWN";
+    }
+}
+
+const char *flight_fuel_name(FuelLevel f)
+{
+    switch (f) {
+    case FUEL_NORMAL:   return "NORMAL";
+    case FUEL_LOW:      return "LOW";
+    case FUEL_CRITICAL: return "CRITICAL";
+    default:            return "UNKNOWN";
+    }
+}
+
 const char *aircraft_category_name(AircraftCategory c)
 {
     switch (c) {
