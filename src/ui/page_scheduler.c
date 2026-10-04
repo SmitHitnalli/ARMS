@@ -127,7 +127,7 @@ static void on_submit_clicked(GtkButton *button, gpointer user_data)
         app_show_notice(ctx, 1, "No REGISTERED flight to submit.");
         return;
     }
-    ArmsStatus st = request_submit(&ctx->sys.requests, &ctx->sys.flights, id);
+    ArmsStatus st = svc_request_submit(&ctx->sys, id);
     snprintf(msg, sizeof msg, "Flight %s submitted and is now WAITING.", id);
     finish(ctx, st, msg);
 }
@@ -157,7 +157,7 @@ static void on_emergency_clicked(GtkButton *button, gpointer user_data)
         return;
     }
     EmergencyLevel lv = (EmergencyLevel)gtk_drop_down_get_selected(GTK_DROP_DOWN(w->emergency_dd));
-    ArmsStatus st = scheduler_set_emergency(&ctx->sys.scheduler, &ctx->sys.flights, id, lv);
+    ArmsStatus st = svc_set_emergency(&ctx->sys, id, lv);
     snprintf(msg, sizeof msg, "Flight %s emergency set to %s.", id, flight_emergency_name(lv));
     finish(ctx, st, msg);
 }
@@ -173,7 +173,7 @@ static void on_fuel_clicked(GtkButton *button, gpointer user_data)
         return;
     }
     FuelLevel lv = (FuelLevel)gtk_drop_down_get_selected(GTK_DROP_DOWN(w->fuel_dd));
-    ArmsStatus st = scheduler_set_fuel(&ctx->sys.scheduler, &ctx->sys.flights, id, lv);
+    ArmsStatus st = svc_set_fuel(&ctx->sys, id, lv);
     snprintf(msg, sizeof msg, "Flight %s fuel set to %s.", id, flight_fuel_name(lv));
     finish(ctx, st, msg);
 }
@@ -190,8 +190,7 @@ static void on_schedule_clicked(GtkButton *button, gpointer user_data)
         app_show_notice(ctx, 1, arms_status_str(st));
         return;
     }
-    st = ops_schedule_next(&ctx->sys.scheduler, &ctx->sys.flights, &ctx->sys.runways,
-                           flight, runway);
+    st = svc_schedule_next(&ctx->sys, flight, runway);
     if (st == ARMS_ERR_NO_RUNWAY || st == ARMS_ERR_EMPTY) {
         app_refresh_all(ctx);   /* the pull may have moved flights into the heap */
         app_show_notice(ctx, 1, st == ARMS_ERR_NO_RUNWAY
@@ -212,17 +211,16 @@ static void on_row_action(GtkButton *button, gpointer user_data)
 
     /* The refresh in finish() destroys this button: copy everything needed above. */
     if (act == ACT_START) {
-        ArmsStatus st = ops_start(&ctx->sys.flights, &ctx->sys.runways, id);
+        ArmsStatus st = svc_start(&ctx->sys, id);
         snprintf(msg, sizeof msg, "Flight %s is now IN_OPERATION.", id);
         finish(ctx, st, msg);
     } else if (act == ACT_COMPLETE) {
-        ArmsStatus st = ops_complete(&ctx->sys.flights, &ctx->sys.runways, &ctx->sys.history, id);
+        ArmsStatus st = svc_complete(&ctx->sys, id);
         snprintf(msg, sizeof msg, "Flight %s completed. Movement history: %d record(s).",
                  id, history_count(&ctx->sys.history));
         finish(ctx, st, msg);
     } else {
-        ArmsStatus st = ops_cancel(&ctx->sys.scheduler, &ctx->sys.holding, &ctx->sys.requests,
-                                   &ctx->sys.flights, &ctx->sys.runways, id);
+        ArmsStatus st = svc_cancel(&ctx->sys, id);
         snprintf(msg, sizeof msg, "Flight %s cancelled.", id);
         finish(ctx, st, msg);
     }

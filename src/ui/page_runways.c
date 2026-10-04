@@ -23,7 +23,7 @@ static void on_status_clicked(GtkButton *button, gpointer user_data)
     snprintf(id, sizeof id, "%s", (const char *)g_object_get_data(G_OBJECT(button), "runway-id"));
     RunwayStatus to = (RunwayStatus)GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "to"));
 
-    ArmsStatus st = runway_set_status(&ctx->sys.runways, id, to);
+    ArmsStatus st = svc_runway_set_status(&ctx->sys, id, to);
     if (st != ARMS_OK) {
         app_show_notice(ctx, 1, arms_status_str(st));
         return;
@@ -96,7 +96,7 @@ static void on_add_clicked(GtkButton *button, gpointer user_data)
     AircraftCategory cat =
         (AircraftCategory)gtk_drop_down_get_selected(GTK_DROP_DOWN(w->category_dd));
 
-    ArmsStatus st = runway_add(&ctx->sys.runways, id, cat);
+    ArmsStatus st = svc_runway_add(&ctx->sys, id, cat);
     if (st != ARMS_OK) {
         app_show_notice(ctx, 1, arms_status_str(st));
         return;

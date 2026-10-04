@@ -2,6 +2,7 @@
 #define SYSTEM_H
 
 #include "common.h"
+#include "eventlog.h"
 #include "flight.h"
 #include "graph.h"
 #include "history.h"
@@ -20,13 +21,14 @@ typedef struct {
     Scheduler       scheduler;  /* owns the priority heap */
     MovementHistory history;    /* linked list: the only part that owns heap memory */
     AirportGraph    graph;
+    EventLog        events;     /* linked list: owns heap memory, like history */
 } ArmsSystem;
 
 /* Makes every part empty. Call once on a new ArmsSystem (never on a live one: it would
- * leak the history list; use arms_system_clear for that). */
+ * leak the history and event lists; use arms_system_clear for that). */
 void arms_system_init(ArmsSystem *s);
 
-/* Frees the history list and resets everything to the empty state. The system must
+/* Frees the history and event lists and resets everything to the empty state. The system must
  * have been initialised before. */
 void arms_system_clear(ArmsSystem *s);
 

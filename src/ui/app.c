@@ -7,7 +7,7 @@
 #include "page_history.h"
 #include "page_graph.h"
 #include "page_reports.h"
-#include "page_placeholder.h"
+#include "page_eventlog.h"
 #include "persist.h"
 
 /* Runtime files, relative to the project root (the executable is <root>/build/arms.exe). */
@@ -36,11 +36,6 @@ static char *project_path(const char *rel)
 static const char *PAGE_TITLE[PAGE_COUNT] = {
     "Dashboard", "Flights", "Runways", "Scheduler", "Holding",
     "Movement History", "Airport Graph", "Reports", "Event Log"
-};
-
-static const char *PAGE_NOTE[PAGE_COUNT] = {
-    "", "", "", "", "", "", "", "",
-    "Needs the event-log module, which does not exist yet"
 };
 
 void app_ctx_init(AppCtx *ctx, GtkApplication *app)
@@ -171,6 +166,7 @@ void app_refresh_all(AppCtx *ctx)
     page_history_refresh(ctx);
     page_graph_refresh(ctx);
     page_reports_refresh(ctx);
+    page_eventlog_refresh(ctx);
 }
 
 /* ---- navigation ---- */
@@ -212,7 +208,7 @@ static GtkWidget *build_pages(AppCtx *ctx)
         else if (i == PAGE_REPORTS)
             page = page_reports_new(ctx);
         else
-            page = page_placeholder_new(PAGE_TITLE[i], PAGE_NOTE[i]);
+            page = page_eventlog_new(ctx);
         gtk_stack_add_named(GTK_STACK(ctx->stack), page, PAGE_TITLE[i]);
     }
     return ctx->stack;

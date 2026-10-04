@@ -1,6 +1,6 @@
 /* Save file format (text, one record per line, fields separated by single spaces):
  *
- *   ARMS-SAVE 1
+ *   ARMS-SAVE 2          (version 1 files are still read; they have no EVENTS section)
  *   FLIGHTS <count> <now> <next_seq>
  *   F <id> <type> <category> <state> <emergency> <fuel> <request_tick> <request_seq> <runway|~>
  *   RUNWAYS <count>
@@ -12,6 +12,8 @@
  *   HISTORY <count>      then   M <flight> <type> <category> <runway> <req_tick> <req_seq> <done_tick>
  *   NODES <count>        then   N <id> [label to end of line]
  *   EDGES <count>        then   E <id> <id>        (each undirected edge once)
+ *   EVENTS <count> <next_seq> <dropped>   (version 2 only)
+ *                        then   V <seq> <tick> <type> <flight|~> <runway|~> <details|~>
  *   END
  *
  * "~" means "none" (it can never be a valid ID). Enums are written by name. */
@@ -24,7 +26,8 @@
 #include "operations.h"
 #include "persist.h"
 
-#define SAVE_HEADER  "ARMS-SAVE 1"
+#define SAVE_HEADER_V1  "ARMS-SAVE 1"
+#define SAVE_HEADER     "ARMS-SAVE 2"    /* what persist_save writes */
 #define NONE_TOKEN   "~"
 #define LINE_LEN     160
 #define PATH_LEN     512
@@ -153,6 +156,13 @@ static void write_system(FILE *f, const ArmsSystem *s)
         for (int j = i + 1; j < s->graph.count; j++)
             if (s->graph.adj[i][j])
                 fprintf(f, "E %s %s\n", s->graph.nodes[i].id, s->graph.nodes[j].id);
+
+    fprintf(f, "EVENTS %d %u %u\n", s->events.count, s->events.next_seq, s->events.dropped);
+    for (const EventNode *n = s->events.head; n != NULL; n = n->next) {
+        const Event *e = &n->data;
+        fprintf(f, "V %u %d %s %s %s %s\n", e->seq, e->tick, eventlog_type_name(e->type),
+                id_or_none(e->flight_id), id_or_none(e->runway_id), id_or_none(e->details));
+    }
 
     fprintf(f, "END\n");
 }
@@ -558,6 +568,55 @@ static ArmsStatus load_graph(Reader *r, ArmsSystem *t)
     return ARMS_OK;
 }
 
+/* Events are history, not live references: their IDs are only checked for shape. */
+static ArmsStatus load_events(Reader *r, ArmsSystem *t)
+{
+    char *h[4];
+    long long count, next_seq, dropped;
+    ArmsStatus st = read_record(r, "EVENTS", 4, h);
+    if (st != ARMS_OK)
+        return st;
+    if (!parse_ll(h[1], 0, INT_MAX, &count) || !parse_ll(h[2], 1, UINT_MAX, &next_seq) ||
+        !parse_ll(h[3], 0, UINT_MAX, &dropped))
+        return ARMS_ERR_FORMAT;
+
+    unsigned last_seq = 0;
+    for (long long i = 0; i < count; i++) {
+        char *g[7];
+        Event e;
+        long long seq, tick;
+        memset(&e, 0, sizeof e);
+
+        st = read_record(r, "V", 7, g);
+        if (st != ARMS_OK)
+            return st;
+        if (!parse_ll(g[1], 1, UINT_MAX, &seq) || !parse_ll(g[2], 0, INT_MAX, &tick) ||
+            !eventlog_type_parse(g[3], &e.type))
+            return ARMS_ERR_FORMAT;
+        if ((st = parse_id(g[4], e.flight_id, 1)) != ARMS_OK ||
+            (st = parse_id(g[5], e.runway_id, 1)) != ARMS_OK)
+            return st;
+        if (strchr(g[6], ' ') != NULL || strlen(g[6]) >= EVENT_DETAILS_LEN)
+            return ARMS_ERR_FORMAT;
+        if (strcmp(g[6], NONE_TOKEN) != 0)
+            strcpy(e.details, g[6]);
+        if ((unsigned)seq <= last_seq)
+            return ARMS_ERR_FORMAT;                      /* sequence must strictly increase */
+        e.seq = (unsigned)seq;
+        e.tick = (int)tick;
+        last_seq = e.seq;
+
+        st = eventlog_restore(&t->events, &e);
+        if (st != ARMS_OK)
+            return st;                                   /* NO_MEMORY */
+    }
+    if ((unsigned long long)next_seq <= last_seq)
+        return ARMS_ERR_FORMAT;
+    t->events.next_seq = (unsigned)next_seq;
+    t->events.dropped = (unsigned)dropped;
+    return ARMS_OK;
+}
+
 static ArmsStatus parse_system(FILE *file, ArmsSystem *t)
 {
     Reader r;
@@ -570,7 +629,12 @@ static ArmsStatus parse_system(FILE *file, ArmsSystem *t)
     st = next_line(&r);
     if (st != ARMS_OK)
         return st;
-    if (strcmp(r.line, SAVE_HEADER) != 0)
+    int version;
+    if (strcmp(r.line, SAVE_HEADER) == 0)
+        version = 2;
+    else if (strcmp(r.line, SAVE_HEADER_V1) == 0)
+        version = 1;                                     /* no EVENTS section: log stays empty */
+    else
         return ARMS_ERR_FORMAT;                          /* wrong file or unknown version */
 
     if ((st = load_flights(&r, t)) != ARMS_OK)
@@ -592,6 +656,8 @@ static ArmsStatus parse_system(FILE *file, ArmsSystem *t)
     if ((st = load_history(&r, t)) != ARMS_OK)
         return st;
     if ((st = load_graph(&r, t)) != ARMS_OK)
+        return st;
+    if (version == 2 && (st = load_events(&r, t)) != ARMS_OK)
         return st;
 
     st = next_line(&r);
@@ -617,10 +683,10 @@ ArmsStatus persist_load(const char *path, ArmsSystem *dest)
     fclose(f);
 
     if (st != ARMS_OK) {
-        arms_system_clear(&temp);        /* frees any history nodes already built */
+        arms_system_clear(&temp);        /* frees any history/event nodes already built */
         return st;
     }
-    arms_system_clear(dest);             /* free the old history, then take over temp's */
+    arms_system_clear(dest);             /* free the old lists, then take over temp's */
     *dest = temp;
     return ARMS_OK;
 }

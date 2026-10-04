@@ -2,6 +2,7 @@
 #define UI_APP_H
 
 #include <gtk/gtk.h>
+#include "service.h"
 #include "system.h"
 
 /* GTK shell only: every core call goes through the existing core API. */
@@ -62,6 +63,14 @@ typedef struct {
     GtkWidget *dev_label;
 } HoldingWidgets;
 
+/* Event Log page: filters, the table and the status line. */
+typedef struct {
+    GtkWidget *grid;
+    GtkWidget *type_dd;        /* "All" + one entry per EventType */
+    GtkWidget *flight_entry;
+    GtkWidget *count_label;
+} EventLogWidgets;
+
 /* Movement History page: the table and the record count. */
 typedef struct {
     GtkWidget *grid;
@@ -113,6 +122,7 @@ typedef struct {
     HistoryWidgets   history_page;
     GraphWidgets     graph_page;
     ReportsWidgets   reports_page;
+    EventLogWidgets  eventlog_page;
     char             save_path[260];
     int              load_failed;   /* 1 = a save exists but could not be loaded: never overwrite it */
 } AppCtx;
@@ -129,7 +139,7 @@ void app_activate(GtkApplication *app, gpointer user_data);
 /* Shows a dismissible message under the header (is_error selects the colour). */
 void app_show_notice(AppCtx *ctx, int is_error, const char *message);
 
-/* Refreshes every page except the Event Log placeholder. */
+/* Refreshes every page. */
 void app_refresh_all(AppCtx *ctx);
 
 #endif

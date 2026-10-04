@@ -11,6 +11,7 @@ void arms_system_init(ArmsSystem *s)
     scheduler_init(&s->scheduler);
     history_init(&s->history);
     graph_init(&s->graph);
+    eventlog_init(&s->events);
 }
 
 void arms_system_clear(ArmsSystem *s)
@@ -18,5 +19,6 @@ void arms_system_clear(ArmsSystem *s)
     if (s == NULL)
         return;
     history_clear(&s->history);
+    eventlog_clear(&s->events);
     arms_system_init(s);
 }

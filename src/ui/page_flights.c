@@ -59,7 +59,7 @@ static void on_add_clicked(GtkButton *button, gpointer user_data)
     AircraftCategory cat =
         (AircraftCategory)gtk_drop_down_get_selected(GTK_DROP_DOWN(w->category_dd));
 
-    ArmsStatus st = flight_add(&ctx->sys.flights, id, type, cat);
+    ArmsStatus st = svc_flight_add(&ctx->sys, id, type, cat);
     if (st != ARMS_OK) {
         app_show_notice(ctx, 1, arms_status_str(st));
         return;

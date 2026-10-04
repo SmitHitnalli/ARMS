@@ -29,7 +29,7 @@ static void on_leave_clicked(GtkButton *button, gpointer user_data)
     char id[ID_MAX_LEN + 1], msg[96];
     snprintf(id, sizeof id, "%s", (const char *)g_object_get_data(G_OBJECT(button), "flight-id"));
 
-    ArmsStatus st = holding_leave(&ctx->sys.holding, &ctx->sys.requests, &ctx->sys.flights, id);
+    ArmsStatus st = svc_hold_leave(&ctx->sys, id);
     snprintf(msg, sizeof msg, "Flight %s left holding and is WAITING at the rear of its queue.", id);
     finish(ctx, st, msg);   /* destroys this button: nothing above may be touched after it */
 }
@@ -46,9 +46,8 @@ static void on_enter_clicked(GtkButton *button, gpointer user_data)
     }
     snprintf(id, sizeof id, "%s", gtk_string_object_get_string(GTK_STRING_OBJECT(item)));
 
-    /* scheduler_hold also handles a flight that is currently in the scheduler heap. */
-    ArmsStatus st = scheduler_hold(&ctx->sys.scheduler, &ctx->sys.holding, &ctx->sys.requests,
-                                   &ctx->sys.flights, id);
+    /* svc_hold_enter also handles a flight that is currently in the scheduler heap. */
+    ArmsStatus st = svc_hold_enter(&ctx->sys, id);
     snprintf(msg, sizeof msg, "Flight %s is now HOLDING.", id);
     finish(ctx, st, msg);
 }

@@ -17,10 +17,13 @@
 #include "reports.h"
 #include "graph.h"
 #include "system.h"
+#include "eventlog.h"
+#include "service.h"
 #include "persist.h"
 
 /* Test-only hook defined in history.c when built with -DARMS_TESTING. */
 extern int history_fail_next_alloc;
+extern int eventlog_fail_next_alloc;
 
 /* Independent copy of the approved transition table, to check flight.c against. */
 static const int expected[STATE_COUNT][STATE_COUNT] = {
@@ -2475,6 +2478,16 @@ static void assert_systems_equal(const ArmsSystem *a, const ArmsSystem *b)
         assert(x->completed_tick == y->completed_tick);
     }
 
+    assert(a->events.count == b->events.count);
+    assert(a->events.next_seq == b->events.next_seq && a->events.dropped == b->events.dropped);
+    for (const EventNode *x = a->events.head, *y = b->events.head; x != NULL; x = x->next, y = y->next) {
+        assert(x->data.seq == y->data.seq && x->data.tick == y->data.tick);
+        assert(x->data.type == y->data.type);
+        assert(strcmp(x->data.flight_id, y->data.flight_id) == 0);
+        assert(strcmp(x->data.runway_id, y->data.runway_id) == 0);
+        assert(strcmp(x->data.details, y->data.details) == 0);
+    }
+
     assert(a->graph.count == b->graph.count);
     for (int i = 0; i < a->graph.count; i++) {
         assert(strcmp(a->graph.nodes[i].id, b->graph.nodes[i].id) == 0);
@@ -2588,7 +2601,7 @@ static void test_persist_save_load_save(void)
     assert(persist_save(BAD_FILE, &b) == ARMS_OK);
     read_file(SAVE_FILE, first, sizeof first);
     read_file(BAD_FILE, second, sizeof second);
-    assert(strncmp(first, "ARMS-SAVE 1\n", 12) == 0);
+    assert(strncmp(first, "ARMS-SAVE 2\n", 12) == 0);
     assert(strstr(first, "\nEND\n") != NULL);
     assert(strcmp(first, second) == 0);
 
@@ -2657,7 +2670,7 @@ static void test_persist_rejects_bad_files(void)
     static char good[TEXT_MAX], bad[TEXT_MAX];
     static const Mutation cases[] = {
         /* header / syntax */
-        { "ARMS-SAVE 1", "ARMS-SAVE 2", ARMS_ERR_FORMAT },
+        { "ARMS-SAVE 2", "ARMS-SAVE 9", ARMS_ERR_FORMAT },
         { "FLIGHTS 15 ", "FLIGHTS x ", ARMS_ERR_FORMAT },
         { "R R1 OCCUPIED LARGE HEAP1", "R R1 OCCUPIED LARGE", ARMS_ERR_FORMAT },
         { "END\n", "", ARMS_ERR_FORMAT },                        /* truncated: no END */
@@ -2735,6 +2748,397 @@ static void test_persist_rejects_bad_files(void)
     remove_save_files(BAD_FILE);
 }
 
+/* ======================================================================= */
+/* Event log and service layer                                             */
+/* ======================================================================= */
+
+static const Event *event_at(const EventLog *log, int index)
+{
+    const EventNode *n = log->head;
+    while (index-- > 0)
+        n = n->next;
+    return &n->data;
+}
+
+static void test_eventlog_basic(void)
+{
+    EventLog log;
+    eventlog_init(&log);
+    assert(eventlog_count(&log) == 0 && log.head == NULL && log.tail == NULL);
+    assert(log.next_seq == 1 && log.dropped == 0);
+
+    assert(eventlog_append(&log, 5, EVENT_FLIGHT_REGISTERED, "F1", NULL, "ARRIVAL") == ARMS_OK);
+    assert(eventlog_count(&log) == 1 && log.head == log.tail);
+    const Event *e = event_at(&log, 0);
+    assert(e->seq == 1 && e->tick == 5 && e->type == EVENT_FLIGHT_REGISTERED);
+    assert(strcmp(e->flight_id, "F1") == 0 && e->runway_id[0] == '\0');
+    assert(strcmp(e->details, "ARRIVAL") == 0);
+
+    /* Chronological order and consecutive sequence numbers. */
+    assert(eventlog_append(&log, 6, EVENT_RUNWAY_ADDED, NULL, "R1", "LARGE") == ARMS_OK);
+    assert(eventlog_append(&log, 7, EVENT_OP_STARTED, "F1", "R1", NULL) == ARMS_OK);
+    assert(eventlog_count(&log) == 3 && log.next_seq == 4);
+    for (int i = 0; i < 3; i++)
+        assert(event_at(&log, i)->seq == (unsigned)i + 1);
+    assert(event_at(&log, 1)->type == EVENT_RUNWAY_ADDED && log.tail->data.seq == 3);
+
+    /* Invalid arguments change nothing. */
+    assert(eventlog_append(NULL, 0, EVENT_HOLD_LEFT, NULL, NULL, NULL) == ARMS_ERR_INVALID_ARG);
+    assert(eventlog_append(&log, 0, EVENT_TYPE_COUNT, NULL, NULL, NULL) == ARMS_ERR_INVALID_ARG);
+    assert(eventlog_count(&log) == 3 && log.next_seq == 4 && log.dropped == 0);
+
+    eventlog_clear(&log);
+    assert(eventlog_count(&log) == 0 && log.head == NULL && log.next_seq == 1);
+    eventlog_clear(&log);                       /* clearing an empty log is fine */
+}
+
+static void test_eventlog_type_names(void)
+{
+    for (int t = 0; t < EVENT_TYPE_COUNT; t++) {
+        EventType back;
+        const char *name = eventlog_type_name((EventType)t);
+        assert(strcmp(name, "UNKNOWN") != 0);
+        assert(eventlog_type_parse(name, &back) && (int)back == t);
+        for (int u = 0; u < t; u++)
+            assert(strcmp(name, eventlog_type_name((EventType)u)) != 0);
+    }
+    EventType x;
+    assert(!eventlog_type_parse("NOPE", &x) && !eventlog_type_parse("", &x));
+    assert(strcmp(eventlog_type_name(EVENT_TYPE_COUNT), "UNKNOWN") == 0);
+    assert(strcmp(eventlog_type_name(EVENT_FLIGHT_REGISTERED), "FLIGHT_REGISTERED") == 0);
+}
+
+static void test_eventlog_details_safety(void)
+{
+    EventLog log;
+    eventlog_init(&log);
+    assert(eventlog_append(&log, 0, EVENT_FUEL_CHANGED, "F1", NULL,
+                           "THIS DETAILS TEXT IS WAY TOO LONG TO FIT") == ARMS_OK);
+    const Event *e = event_at(&log, 0);
+    assert(strlen(e->details) == EVENT_DETAILS_LEN - 1);
+    assert(strchr(e->details, ' ') == NULL);                 /* spaces became '_' */
+    assert(strncmp(e->details, "THIS_DETAILS_TEXT_IS", 20) == 0);
+    assert(eventlog_append(&log, 0, EVENT_FUEL_CHANGED, "F1", NULL, "A\tB\nC") == ARMS_OK);
+    assert(strcmp(event_at(&log, 1)->details, "A_B_C") == 0);
+    /* An over-long ID is truncated, never overflowed. */
+    assert(eventlog_append(&log, 0, EVENT_HOLD_LEFT, "AAAAAAAAAAAAAAAAAAAAAAAA", NULL, NULL) == ARMS_OK);
+    assert(strlen(event_at(&log, 2)->flight_id) == ID_MAX_LEN);
+    eventlog_clear(&log);
+}
+
+static void test_eventlog_alloc_failure(void)
+{
+    EventLog log;
+    eventlog_init(&log);
+    assert(eventlog_append(&log, 0, EVENT_HOLD_LEFT, "F1", NULL, NULL) == ARMS_OK);
+    eventlog_fail_next_alloc = 1;
+    assert(eventlog_append(&log, 0, EVENT_HOLD_LEFT, "F2", NULL, NULL) == ARMS_ERR_NO_MEMORY);
+    assert(eventlog_count(&log) == 1 && log.dropped == 1 && log.next_seq == 2);
+    assert(eventlog_append(&log, 0, EVENT_HOLD_LEFT, "F3", NULL, NULL) == ARMS_OK);
+    assert(event_at(&log, 1)->seq == 2);                     /* no gap in the sequence */
+    eventlog_clear(&log);
+}
+
+/* Counts events of one type in a system's log. */
+static int count_type(const ArmsSystem *s, EventType t)
+{
+    int n = 0;
+    for (const EventNode *e = s->events.head; e != NULL; e = e->next)
+        n += e->data.type == t;
+    return n;
+}
+
+static void test_service_logs_one_event_each(void)
+{
+    ArmsSystem s;
+    arms_system_init(&s);
+    char f[ID_MAX_LEN + 1], r[ID_MAX_LEN + 1];
+
+    assert(svc_flight_add(&s, "F1", FLIGHT_ARRIVAL, AIRCRAFT_MEDIUM) == ARMS_OK);
+    assert(svc_runway_add(&s, "R1", AIRCRAFT_LARGE) == ARMS_OK);
+    assert(svc_request_submit(&s, "F1") == ARMS_OK);
+    assert(svc_hold_enter(&s, "F1") == ARMS_OK);
+    assert(svc_hold_leave(&s, "F1") == ARMS_OK);
+    assert(svc_set_emergency(&s, "F1", EMERGENCY_ACTIVE) == ARMS_OK);
+    assert(svc_set_fuel(&s, "F1", FUEL_LOW) == ARMS_OK);
+    assert(scheduler_pull(&s.scheduler, &s.requests, &s.flights) == ARMS_OK);   /* not logged */
+    assert(svc_schedule_next(&s, f, r) == ARMS_OK);
+    assert(svc_start(&s, "F1") == ARMS_OK);
+    assert(svc_complete(&s, "F1") == ARMS_OK);
+    assert(svc_runway_set_status(&s, "R1", RUNWAY_CLOSED) == ARMS_OK);
+    assert(svc_runway_set_status(&s, "R1", RUNWAY_AVAILABLE) == ARMS_OK);
+    assert(svc_flight_add(&s, "F2", FLIGHT_DEPARTURE, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(svc_cancel(&s, "F2") == ARMS_OK);
+
+    static const EventType want[] = {
+        EVENT_FLIGHT_REGISTERED, EVENT_RUNWAY_ADDED, EVENT_REQUEST_SUBMITTED, EVENT_HOLD_ENTERED,
+        EVENT_HOLD_LEFT, EVENT_EMERGENCY_CHANGED, EVENT_FUEL_CHANGED, EVENT_FLIGHT_SCHEDULED,
+        EVENT_OP_STARTED, EVENT_OP_COMPLETED, EVENT_RUNWAY_CLOSED, EVENT_RUNWAY_REOPENED,
+        EVENT_FLIGHT_REGISTERED, EVENT_FLIGHT_CANCELLED
+    };
+    int n = (int)(sizeof want / sizeof want[0]);
+    assert(eventlog_count(&s.events) == n);                  /* the pull added nothing */
+    for (int i = 0; i < n; i++) {
+        assert(event_at(&s.events, i)->type == want[i]);
+        assert(event_at(&s.events, i)->seq == (unsigned)i + 1);
+    }
+
+    /* Ids and details are captured correctly, including the runway cleared by completion. */
+    assert(strcmp(event_at(&s.events, 0)->details, "ARRIVAL") == 0);
+    assert(strcmp(event_at(&s.events, 2)->details, "LANDING") == 0);
+    assert(strcmp(event_at(&s.events, 5)->details, "ACTIVE") == 0);
+    assert(strcmp(event_at(&s.events, 6)->details, "LOW") == 0);
+    assert(strcmp(event_at(&s.events, 7)->flight_id, "F1") == 0);
+    assert(strcmp(event_at(&s.events, 7)->runway_id, "R1") == 0);
+    assert(strcmp(event_at(&s.events, 9)->runway_id, "R1") == 0);
+    assert(strcmp(event_at(&s.events, 10)->details, "CLOSED") == 0);
+    assert(strcmp(event_at(&s.events, 13)->details, "REGISTERED") == 0);   /* state before */
+    assert(ops_check_invariants(&s.flights, &s.runways, &s.scheduler));
+    arms_system_clear(&s);
+}
+
+static void test_service_failures_log_nothing(void)
+{
+    ArmsSystem s;
+    arms_system_init(&s);
+    assert(svc_flight_add(&s, "F1", FLIGHT_ARRIVAL, AIRCRAFT_MEDIUM) == ARMS_OK);
+    assert(svc_runway_add(&s, "R1", AIRCRAFT_LARGE) == ARMS_OK);
+    int base = eventlog_count(&s.events);
+    char f[ID_MAX_LEN + 1], r[ID_MAX_LEN + 1];
+
+    assert(svc_flight_add(&s, "F1", FLIGHT_ARRIVAL, AIRCRAFT_MEDIUM) == ARMS_ERR_DUPLICATE);
+    assert(svc_flight_add(&s, "bad id", FLIGHT_ARRIVAL, AIRCRAFT_MEDIUM) != ARMS_OK);
+    assert(svc_runway_add(&s, "R1", AIRCRAFT_LARGE) == ARMS_ERR_DUPLICATE);
+    assert(svc_runway_set_status(&s, "NOPE", RUNWAY_CLOSED) != ARMS_OK);
+    assert(svc_request_submit(&s, "NOPE") != ARMS_OK);
+    assert(svc_hold_enter(&s, "F1") != ARMS_OK);              /* REGISTERED, not WAITING */
+    assert(svc_hold_leave(&s, "F1") != ARMS_OK);
+    assert(svc_set_emergency(&s, "NOPE", EMERGENCY_ACTIVE) != ARMS_OK);
+    assert(svc_set_fuel(&s, "NOPE", FUEL_LOW) != ARMS_OK);
+    assert(svc_schedule_next(&s, f, r) == ARMS_ERR_EMPTY);
+    assert(svc_start(&s, "F1") != ARMS_OK);
+    assert(svc_complete(&s, "F1") != ARMS_OK);
+    assert(svc_cancel(&s, "NOPE") != ARMS_OK);
+    assert(svc_start(&s, NULL) != ARMS_OK);
+    assert(eventlog_count(&s.events) == base && s.events.dropped == 0);
+
+    /* Unchanged emergency / fuel values are not events. */
+    assert(svc_set_emergency(&s, "F1", EMERGENCY_NONE) == ARMS_OK);
+    assert(svc_set_fuel(&s, "F1", FUEL_NORMAL) == ARMS_OK);
+    assert(eventlog_count(&s.events) == base);
+    assert(svc_set_fuel(&s, "F1", FUEL_CRITICAL) == ARMS_OK);
+    assert(svc_set_fuel(&s, "F1", FUEL_CRITICAL) == ARMS_OK);
+    assert(count_type(&s, EVENT_FUEL_CHANGED) == 1);
+    arms_system_clear(&s);
+}
+
+static void test_service_log_failure_keeps_operation(void)
+{
+    ArmsSystem s;
+    arms_system_init(&s);
+    assert(svc_flight_add(&s, "F1", FLIGHT_ARRIVAL, AIRCRAFT_MEDIUM) == ARMS_OK);
+    assert(svc_runway_add(&s, "R1", AIRCRAFT_LARGE) == ARMS_OK);
+    assert(svc_request_submit(&s, "F1") == ARMS_OK);
+    assert(scheduler_pull(&s.scheduler, &s.requests, &s.flights) == ARMS_OK);
+    int base = eventlog_count(&s.events);
+    char f[ID_MAX_LEN + 1], r[ID_MAX_LEN + 1];
+
+    eventlog_fail_next_alloc = 1;
+    assert(svc_schedule_next(&s, f, r) == ARMS_OK);          /* the operation still succeeds */
+    assert(strcmp(f, "F1") == 0 && strcmp(r, "R1") == 0);
+    assert(flight_find(&s.flights, "F1")->state == STATE_SCHEDULED);
+    assert(runway_find(&s.runways, "R1")->status == RUNWAY_OCCUPIED);
+    assert(eventlog_count(&s.events) == base && s.events.dropped == 1);
+    assert(s.events.next_seq == (unsigned)base + 1);
+    assert(ops_check_invariants(&s.flights, &s.runways, &s.scheduler));
+
+    assert(svc_start(&s, "F1") == ARMS_OK);                  /* the next event is fine */
+    assert(eventlog_count(&s.events) == base + 1);
+    assert(event_at(&s.events, base)->seq == (unsigned)base + 1);   /* no gap */
+
+    eventlog_fail_next_alloc = 1;
+    assert(svc_complete(&s, "F1") == ARMS_OK);
+    assert(history_count(&s.history) == 1 && s.events.dropped == 2);
+    assert(ops_check_invariants(&s.flights, &s.runways, &s.scheduler));
+    arms_system_clear(&s);
+}
+
+/* The same action script, run twice, must give identical logs. */
+static void run_script(ArmsSystem *s)
+{
+    char f[ID_MAX_LEN + 1], r[ID_MAX_LEN + 1];
+    arms_system_init(s);
+    svc_runway_add(s, "R1", AIRCRAFT_LARGE);
+    for (int i = 0; i < 3; i++) {
+        char id[8];
+        snprintf(id, sizeof id, "F%d", i);
+        svc_flight_add(s, id, i % 2 ? FLIGHT_DEPARTURE : FLIGHT_ARRIVAL, AIRCRAFT_SMALL);
+        svc_request_submit(s, id);
+    }
+    svc_set_emergency(s, "F2", EMERGENCY_ACTIVE);
+    for (int i = 0; i < 3; i++) {
+        scheduler_pull(&s->scheduler, &s->requests, &s->flights);
+        if (svc_schedule_next(s, f, r) == ARMS_OK) {
+            svc_start(s, f);
+            svc_complete(s, f);
+        }
+    }
+}
+
+static void test_service_deterministic_order(void)
+{
+    ArmsSystem a, b;
+    run_script(&a);
+    run_script(&b);
+    assert(eventlog_count(&a.events) == eventlog_count(&b.events));
+    assert(eventlog_count(&a.events) > 10);
+    assert_systems_equal(&a, &b);
+    /* The emergency flight F2 is scheduled first. */
+    const EventNode *e = a.events.head;
+    while (e != NULL && e->data.type != EVENT_FLIGHT_SCHEDULED)
+        e = e->next;
+    assert(e != NULL && strcmp(e->data.flight_id, "F2") == 0);
+    arms_system_clear(&a);
+    arms_system_clear(&b);
+}
+
+static void test_persist_events(void)
+{
+    static char good[TEXT_MAX], bad[TEXT_MAX];
+    ArmsSystem src, dest, ref;
+    arms_system_init(&src);
+    run_script(&src);
+    src.events.dropped = 3;                                  /* must survive the round trip */
+    remove_save_files(SAVE_FILE);
+    assert(persist_save(SAVE_FILE, &src) == ARMS_OK);
+    read_file(SAVE_FILE, good, sizeof good);
+    assert(strstr(good, "\nEVENTS ") != NULL);
+    assert(strstr(good, "\nV 1 0 RUNWAY_ADDED ~ R1 LARGE\n") != NULL);
+
+    arms_system_init(&dest);
+    assert(persist_load(SAVE_FILE, &dest) == ARMS_OK);
+    assert_systems_equal(&src, &dest);
+    assert(dest.events.dropped == 3 && dest.events.next_seq == src.events.next_seq);
+    /* A loaded log keeps counting from next_seq. */
+    assert(svc_flight_add(&dest, "NEW1", FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(dest.events.tail->data.seq == src.events.next_seq);
+    arms_system_clear(&dest);
+
+    /* An empty log round-trips, replacing whatever the destination had. */
+    arms_system_clear(&src);
+    assert(persist_save(SAVE_FILE, &src) == ARMS_OK);
+    arms_system_init(&dest);
+    assert(svc_flight_add(&dest, "X", FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(persist_load(SAVE_FILE, &dest) == ARMS_OK);
+    assert(dest.events.count == 0 && dest.events.next_seq == 1);
+    arms_system_clear(&dest);
+
+    /* Malformed EVENTS sections are rejected and leave the destination unchanged. */
+    run_script(&src);
+    assert(persist_save(SAVE_FILE, &src) == ARMS_OK);
+    read_file(SAVE_FILE, good, sizeof good);
+    static const Mutation cases[] = {
+        { "V 2 ", "V 1 ", ARMS_ERR_FORMAT },                         /* duplicate seq */
+        { "V 3 ", "V 9 ", ARMS_ERR_FORMAT },                         /* seq not increasing */
+        { "RUNWAY_ADDED", "RUNWAY_ADDEDX", ARMS_ERR_FORMAT },        /* unknown type name */
+        { "RUNWAY_ADDED ~ R1", "RUNWAY_ADDED ~ r1", ARMS_ERR_INVALID_ID },
+        { "RUNWAY_ADDED ~ R1 LARGE", "RUNWAY_ADDED ~ R1 LA RGE", ARMS_ERR_FORMAT },
+        { "V 1 0 RUNWAY_ADDED", "V 1 -1 RUNWAY_ADDED", ARMS_ERR_FORMAT },
+        { "RUNWAY_ADDED ~ R1 LARGE", "RUNWAY_ADDED ~ R1", ARMS_ERR_FORMAT },
+        { "EVENTS ", "EVENTS 99", ARMS_ERR_FORMAT },                 /* count too big */
+        { "EVENTS ", "EVENTS x", ARMS_ERR_FORMAT },
+        { "END\n", "", ARMS_ERR_FORMAT },
+    };
+    build_full_system(&ref);
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        mutate(good, cases[i].from, cases[i].to, bad, sizeof bad);
+        write_file(BAD_FILE, bad, strlen(bad));
+        build_full_system(&dest);
+        ArmsStatus st = persist_load(BAD_FILE, &dest);
+        if (st != cases[i].expect)
+            printf("events case %zu (%s): got %s\n", i, cases[i].from, arms_status_str(st));
+        assert(st == cases[i].expect);
+        assert_systems_equal(&dest, &ref);
+        arms_system_clear(&dest);
+    }
+
+    /* next_seq must be above every stored seq; dropped must parse. */
+    char hdr[64], bad_hdr[64];
+    snprintf(hdr, sizeof hdr, "EVENTS %d %u 0", src.events.count, src.events.next_seq);
+    snprintf(bad_hdr, sizeof bad_hdr, "EVENTS %d %u 0", src.events.count, src.events.count);
+    mutate(good, hdr, bad_hdr, bad, sizeof bad);
+    write_file(BAD_FILE, bad, strlen(bad));
+    build_full_system(&dest);
+    assert(persist_load(BAD_FILE, &dest) == ARMS_ERR_FORMAT);
+    snprintf(bad_hdr, sizeof bad_hdr, "EVENTS %d %u zz", src.events.count, src.events.next_seq);
+    mutate(good, hdr, bad_hdr, bad, sizeof bad);
+    write_file(BAD_FILE, bad, strlen(bad));
+    assert(persist_load(BAD_FILE, &dest) == ARMS_ERR_FORMAT);
+    assert_systems_equal(&dest, &ref);
+    arms_system_clear(&dest);
+
+    /* Event allocation fails during load: NO_MEMORY, destination unchanged. */
+    build_full_system(&dest);
+    eventlog_fail_next_alloc = 1;
+    assert(persist_load(SAVE_FILE, &dest) == ARMS_ERR_NO_MEMORY);
+    assert(eventlog_fail_next_alloc == 0);
+    assert_systems_equal(&dest, &ref);
+    arms_system_clear(&dest);
+
+    arms_system_clear(&src);
+    arms_system_clear(&ref);
+    remove_save_files(SAVE_FILE);
+    remove_save_files(BAD_FILE);
+}
+
+/* A version-1 file (no EVENTS section) still loads, with an empty log. */
+static void test_persist_v1_compat(void)
+{
+    static char text[TEXT_MAX], v1[TEXT_MAX], v2_no_events[TEXT_MAX];
+    ArmsSystem src, dest, ref;
+    build_full_system(&src);
+    build_full_system(&ref);
+    remove_save_files(SAVE_FILE);
+    assert(persist_save(SAVE_FILE, &src) == ARMS_OK);
+    read_file(SAVE_FILE, text, sizeof text);
+
+    char *ev = strstr(text, "EVENTS ");
+    assert(ev != NULL);
+    strcpy(v2_no_events, text);
+    strcpy(v2_no_events + (ev - text), "END\n");             /* v2 header, EVENTS removed */
+    mutate(v2_no_events, "ARMS-SAVE 2", "ARMS-SAVE 1", v1, sizeof v1);
+    write_file(BAD_FILE, v1, strlen(v1));
+
+    arms_system_init(&dest);
+    assert(svc_flight_add(&dest, "OLD", FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(persist_load(BAD_FILE, &dest) == ARMS_OK);        /* replaces everything */
+    assert(dest.events.count == 0 && dest.events.next_seq == 1 && dest.events.dropped == 0);
+    assert(dest.flights.count == src.flights.count);
+    assert(svc_flight_add(&dest, "AFTER1", FLIGHT_ARRIVAL, AIRCRAFT_SMALL) == ARMS_OK);
+    assert(dest.events.head->data.seq == 1);
+    arms_system_clear(&dest);
+
+    /* Neither version is quietly read as the other: a v2 header without EVENTS is
+     * truncated, and a v1 header followed by EVENTS is trailing junk. */
+    write_file(BAD_FILE, v2_no_events, strlen(v2_no_events));
+    build_full_system(&dest);
+    assert(persist_load(BAD_FILE, &dest) == ARMS_ERR_FORMAT);
+    assert_systems_equal(&dest, &ref);
+    arms_system_clear(&dest);
+
+    mutate(text, "ARMS-SAVE 2", "ARMS-SAVE 1", v1, sizeof v1);
+    write_file(BAD_FILE, v1, strlen(v1));
+    build_full_system(&dest);
+    assert(persist_load(BAD_FILE, &dest) == ARMS_ERR_FORMAT);
+    assert_systems_equal(&dest, &ref);
+    arms_system_clear(&dest);
+
+    arms_system_clear(&src);
+    arms_system_clear(&ref);
+    remove_save_files(SAVE_FILE);
+    remove_save_files(BAD_FILE);
+}
+
 int main(void)
 {
     test_ids_and_common();
@@ -2800,6 +3204,16 @@ int main(void)
     test_persist_capacity_round_trip();
     test_persist_missing_and_io_errors();
     test_persist_rejects_bad_files();
+    test_eventlog_basic();
+    test_eventlog_type_names();
+    test_eventlog_details_safety();
+    test_eventlog_alloc_failure();
+    test_service_logs_one_event_each();
+    test_service_failures_log_nothing();
+    test_service_log_failure_keeps_operation();
+    test_service_deterministic_order();
+    test_persist_events();
+    test_persist_v1_compat();
 
     printf("All core tests passed.\n");
     return 0;
