@@ -41,6 +41,3 @@ Desktop.ini
 data/*.dat
 data/*.bin
 !data/.gitkeep
-
-# Claude Code local settings
-.claude/settings.local.json
