@@ -9,6 +9,7 @@
 #include "page_reports.h"
 #include "page_eventlog.h"
 #include "persist.h"
+#include "demo.h"
 
 /* Runtime files, relative to the project root (the executable is <root>/build/arms.exe). */
 #define SAVE_PATH "data/arms.dat"
@@ -144,6 +145,66 @@ static void on_save_clicked(GtkButton *button, gpointer user_data)
     save_now(user_data, 1);
 }
 
+/* ---- demo ---- */
+
+static int system_is_empty(const ArmsSystem *s)
+{
+    return flight_count(&s->flights) == 0 && runway_count(&s->runways) == 0 &&
+           graph_node_count(&s->graph) == 0 && history_count(&s->history) == 0 &&
+           eventlog_count(&s->events) == 0;
+}
+
+/* Builds the demo into a temporary system first; the live system is replaced only if the
+ * whole build succeeded. Memory only: nothing is written to disk here. */
+static void load_demo(AppCtx *ctx)
+{
+    ArmsSystem demo;
+    ArmsStatus st = demo_build(&demo);
+    if (st != ARMS_OK) {            /* demo_build already freed its partial state */
+        char msg[200];
+        snprintf(msg, sizeof msg, "Could not build the demo (%s). Nothing was changed.",
+                 arms_status_str(st));
+        app_show_notice(ctx, 1, msg);
+        return;
+    }
+    arms_system_clear(&ctx->sys);   /* free the old history/event lists, then take over demo's */
+    ctx->sys = demo;
+    app_refresh_all(ctx);
+    app_show_notice(ctx, 0, "Demo loaded in memory only. Click Save (or close the app) to keep it.");
+}
+
+static void on_demo_confirmed(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+    AppCtx *ctx = user_data;
+    int choice = gtk_alert_dialog_choose_finish(GTK_ALERT_DIALOG(source), res, NULL);
+    if (choice == 1)                /* 0 = Cancel, 1 = Replace; errors/dismiss give -1 */
+        load_demo(ctx);
+}
+
+static void on_demo_clicked(GtkButton *button, gpointer user_data)
+{
+    (void)button;
+    AppCtx *ctx = user_data;
+
+    if (ctx->load_failed) {
+        app_show_notice(ctx, 1, "Load Demo is disabled: the existing save could not be loaded.");
+        return;
+    }
+    if (system_is_empty(&ctx->sys)) {
+        load_demo(ctx);
+        return;
+    }
+    GtkAlertDialog *dialog = gtk_alert_dialog_new("Replace current data with the demo?");
+    gtk_alert_dialog_set_detail(dialog, "The current in-memory data will be replaced. "
+                                        "The save file is not touched until you save.");
+    const char *buttons[] = {"Cancel", "Replace", NULL};
+    gtk_alert_dialog_set_buttons(dialog, buttons);
+    gtk_alert_dialog_set_cancel_button(dialog, 0);
+    gtk_alert_dialog_set_default_button(dialog, 0);
+    gtk_alert_dialog_choose(dialog, ctx->window, NULL, on_demo_confirmed, ctx);
+    g_object_unref(dialog);
+}
+
 /* Returning TRUE cancels the close. A blocked save (load_failed) must not trap the user. */
 static gboolean on_close_request(GtkWindow *window, gpointer user_data)
 {
@@ -276,6 +337,9 @@ void app_activate(GtkApplication *app, gpointer user_data)
     GtkWidget *save = gtk_button_new_with_label("Save");
     g_signal_connect(save, "clicked", G_CALLBACK(on_save_clicked), ctx);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(header), save);
+    GtkWidget *demo = gtk_button_new_with_label("Load Demo");
+    g_signal_connect(demo, "clicked", G_CALLBACK(on_demo_clicked), ctx);
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(header), demo);
     gtk_window_set_titlebar(ctx->window, header);
 
     GtkWidget *body = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
@@ -289,6 +353,7 @@ void app_activate(GtkApplication *app, gpointer user_data)
     gtk_window_set_child(ctx->window, root);
 
     load_on_startup(ctx);
+    gtk_widget_set_sensitive(demo, !ctx->load_failed);
     app_refresh_all(ctx);
 
     g_signal_connect(ctx->window, "close-request", G_CALLBACK(on_close_request), ctx);

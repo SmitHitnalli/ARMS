@@ -20,6 +20,7 @@
 #include "eventlog.h"
 #include "service.h"
 #include "persist.h"
+#include "demo.h"
 
 /* Test-only hook defined in history.c when built with -DARMS_TESTING. */
 extern int history_fail_next_alloc;
@@ -3139,6 +3140,145 @@ static void test_persist_v1_compat(void)
     remove_save_files(BAD_FILE);
 }
 
+/* ---- demo scenario, end to end ---- */
+
+static int count_state(const FlightStore *fs, FlightState st)
+{
+    int n = 0;
+    for (int i = 0; i < flight_count(fs); i++)
+        if (flight_at(fs, i)->state == st)
+            n++;
+    return n;
+}
+
+static int count_available_runways(const RunwayStore *rs)
+{
+    int n = 0;
+    for (int i = 0; i < runway_count(rs); i++)
+        if (runway_at(rs, i)->status == RUNWAY_AVAILABLE)
+            n++;
+    return n;
+}
+
+static int count_emergencies(const FlightStore *fs)
+{
+    int n = 0;
+    for (int i = 0; i < flight_count(fs); i++)
+        if (flight_at(fs, i)->emergency == EMERGENCY_ACTIVE)
+            n++;
+    return n;
+}
+
+static void test_demo_end_to_end(void)
+{
+    ArmsSystem a, b;
+    char f[ID_MAX_LEN + 1], r[ID_MAX_LEN + 1];
+    int order[MAX_NODES], n, reach;
+
+    assert(demo_build(&a) == ARMS_OK);
+    arms_system_init(&b);
+
+    /* Headline counts. */
+    assert(flight_count(&a.flights) == 11);
+    assert(runway_count(&a.runways) == 3);
+    assert(count_state(&a.flights, STATE_WAITING) == 7);
+    assert(count_state(&a.flights, STATE_HOLDING) == 1);
+    assert(count_state(&a.flights, STATE_REGISTERED) == 2);
+    assert(count_state(&a.flights, STATE_COMPLETED) == 1);
+    assert(count_state(&a.flights, STATE_SCHEDULED) == 0);
+    assert(count_state(&a.flights, STATE_IN_OPERATION) == 0);
+    assert(count_emergencies(&a.flights) == 1);
+    assert(count_available_runways(&a.runways) == 2);
+    assert(runway_find(&a.runways, "RWY-03")->status == RUNWAY_CLOSED);
+    assert(history_count(&a.history) == 1);
+    assert(history_find(&a.history, "AI101") != NULL);
+
+    /* Structures: heap membership, valid heap, emergency on top. */
+    assert(heap_count(&a.scheduler.heap) == 5);
+    const char *in_heap[] = {"BA202", "AF150", "KL330", "SQ610", "EK505"};
+    for (int i = 0; i < 5; i++)
+        assert(scheduler_contains(&a.scheduler, in_heap[i]));
+    assert(heap_is_valid(&a.scheduler.heap, &a.flights));
+    assert(strcmp(scheduler_peek(&a.scheduler), "AF150") == 0);
+    assert(queue_count(&a.requests.landing) == 1);   /* DL410 */
+    assert(queue_count(&a.requests.takeoff) == 1);   /* TK150 */
+    assert(holding_count(&a.holding) == 1);
+    assert(flight_find(&a.flights, "LH720")->state == STATE_HOLDING);
+    assert(flight_find(&a.flights, "UA901")->state == STATE_REGISTERED);
+    assert(flight_find(&a.flights, "QR077")->state == STATE_REGISTERED);
+    assert(ops_check_invariants(&a.flights, &a.runways, &a.scheduler));
+
+    /* Graph: populated, MAINT isolated. */
+    assert(graph_node_count(&a.graph) == 8);
+    assert(graph_bfs(&a.graph, "TERMINAL", order, MAX_NODES, &n) == ARMS_OK && n == 7);
+    assert(graph_dfs(&a.graph, "TERMINAL", order, MAX_NODES, &n) == ARMS_OK && n == 7);
+    assert(graph_is_reachable(&a.graph, "TERMINAL", "RWY-02-ENT", &reach) == ARMS_OK && reach);
+    assert(graph_is_reachable(&a.graph, "TERMINAL", "MAINT", &reach) == ARMS_OK && !reach);
+
+    /* Event log: one event per successful svc_* call made by demo_build. */
+    assert(eventlog_count(&a.events) == 31);
+    assert(a.events.dropped == 0);
+
+    /* Pull the two queued flights, then check the full priority order via the report. */
+    assert(scheduler_pull(&a.scheduler, &a.requests, &a.flights) == ARMS_OK);
+    assert(heap_count(&a.scheduler.heap) == 7);
+    assert(heap_is_valid(&a.scheduler.heap, &a.flights));
+    const Flight *sorted[MAX_FLIGHTS];
+    assert(report_flights_sorted(&a.flights, FLIGHT_SORT_PRIORITY, 1, sorted, MAX_FLIGHTS, &n) == ARMS_OK);
+    const char *expect[] = {"AF150", "BA202", "KL330", "DL410", "SQ610", "EK505", "TK150"};
+    int k = 0;
+    for (int i = 0; i < n; i++)
+        if (sorted[i]->state == STATE_WAITING) {
+            assert(k < 7);
+            assert(strcmp(sorted[i]->id, expect[k++]) == 0);
+        }
+    assert(k == 7);
+
+    /* AF150 takes RWY-01 (first compatible runway). */
+    int events_before = eventlog_count(&a.events);
+    assert(svc_schedule_next(&a, f, r) == ARMS_OK);
+    assert(strcmp(f, "AF150") == 0 && strcmp(r, "RWY-01") == 0);
+    assert(svc_start(&a, "AF150") == ARMS_OK);
+    assert(flight_find(&a.flights, "AF150")->state == STATE_IN_OPERATION);
+
+    /* BA202 (LARGE) is blocked: RWY-01 busy, RWY-02 too small. KL330 (SMALL) is the next
+     * eligible flight and uses RWY-02. BA202 stays WAITING in the heap. */
+    assert(svc_schedule_next(&a, f, r) == ARMS_OK);
+    assert(strcmp(f, "KL330") == 0 && strcmp(r, "RWY-02") == 0);
+    assert(flight_find(&a.flights, "BA202")->state == STATE_WAITING);
+    assert(scheduler_contains(&a.scheduler, "BA202"));
+    assert(ops_check_invariants(&a.flights, &a.runways, &a.scheduler));
+
+    /* Complete AF150: runway released, history and events grow. */
+    assert(svc_complete(&a, "AF150") == ARMS_OK);
+    assert(runway_find(&a.runways, "RWY-01")->status == RUNWAY_AVAILABLE);
+    assert(flight_find(&a.flights, "AF150")->state == STATE_COMPLETED);
+    assert(history_count(&a.history) == 2);
+    assert(eventlog_count(&a.events) == events_before + 4);   /* 2 schedule + start + complete */
+    assert(ops_check_invariants(&a.flights, &a.runways, &a.scheduler));
+
+    /* Save, load into another system, compare. */
+    remove_save_files(SAVE_FILE);
+    assert(persist_save(SAVE_FILE, &a) == ARMS_OK);
+    assert(persist_load(SAVE_FILE, &b) == ARMS_OK);
+    assert_systems_equal(&a, &b);
+    assert(history_count(&b.history) == 2);
+    assert(eventlog_count(&b.events) == eventlog_count(&a.events));
+    assert(holding_count(&b.holding) == 1);
+    assert(ops_check_invariants(&b.flights, &b.runways, &b.scheduler));
+
+    arms_system_clear(&a);
+    arms_system_clear(&b);
+    remove_save_files(SAVE_FILE);
+
+    /* Deterministic: two builds give the same system. */
+    assert(demo_build(&a) == ARMS_OK);
+    assert(demo_build(&b) == ARMS_OK);
+    assert_systems_equal(&a, &b);
+    arms_system_clear(&a);
+    arms_system_clear(&b);
+}
+
 int main(void)
 {
     test_ids_and_common();
@@ -3214,6 +3354,7 @@ int main(void)
     test_service_deterministic_order();
     test_persist_events();
     test_persist_v1_compat();
+    test_demo_end_to_end();
 
     printf("All core tests passed.\n");
     return 0;
