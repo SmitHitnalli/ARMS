@@ -1,0 +1,223 @@
+#include "app.h"
+#include "page_dashboard.h"
+#include "page_placeholder.h"
+#include "persist.h"
+
+#define SAVE_PATH "data/arms.dat"
+#define CSS_PATH  "assets/css/arms.css"
+
+static const char *PAGE_TITLE[PAGE_COUNT] = {
+    "Dashboard", "Flights", "Runways", "Scheduler", "Holding",
+    "Movement History", "Airport Graph", "Reports", "Event Log"
+};
+
+static const char *PAGE_NOTE[PAGE_COUNT] = {
+    "", "Coming in a later phase", "Coming in a later phase", "Coming in a later phase",
+    "Coming in a later phase", "Coming in a later phase", "Coming in a later phase",
+    "Coming in a later phase", "Needs the event-log module, which does not exist yet"
+};
+
+void app_ctx_init(AppCtx *ctx, GtkApplication *app)
+{
+    memset(ctx, 0, sizeof *ctx);
+    arms_system_init(&ctx->sys);
+    ctx->app = app;
+    snprintf(ctx->save_path, sizeof ctx->save_path, "%s", SAVE_PATH);
+}
+
+void app_ctx_free(AppCtx *ctx)
+{
+    arms_system_clear(&ctx->sys);
+}
+
+/* ---- notification area ---- */
+
+void app_show_notice(AppCtx *ctx, int is_error, const char *message)
+{
+    gtk_widget_remove_css_class(ctx->notice_box, "notice-error");
+    gtk_widget_remove_css_class(ctx->notice_box, "notice-success");
+    gtk_widget_add_css_class(ctx->notice_box, is_error ? "notice-error" : "notice-success");
+    gtk_label_set_text(GTK_LABEL(ctx->notice_label), message);
+    gtk_revealer_set_reveal_child(GTK_REVEALER(ctx->notice), TRUE);
+}
+
+static void on_notice_dismiss(GtkButton *button, gpointer user_data)
+{
+    (void)button;
+    AppCtx *ctx = user_data;
+    gtk_revealer_set_reveal_child(GTK_REVEALER(ctx->notice), FALSE);
+}
+
+static GtkWidget *notice_new(AppCtx *ctx)
+{
+    ctx->notice = gtk_revealer_new();
+    ctx->notice_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_add_css_class(ctx->notice_box, "notice");
+
+    ctx->notice_label = gtk_label_new("");
+    gtk_widget_set_hexpand(ctx->notice_label, TRUE);
+    gtk_widget_set_halign(ctx->notice_label, GTK_ALIGN_START);
+    gtk_label_set_wrap(GTK_LABEL(ctx->notice_label), TRUE);
+
+    GtkWidget *dismiss = gtk_button_new_with_label("Dismiss");
+    g_signal_connect(dismiss, "clicked", G_CALLBACK(on_notice_dismiss), ctx);
+
+    gtk_box_append(GTK_BOX(ctx->notice_box), ctx->notice_label);
+    gtk_box_append(GTK_BOX(ctx->notice_box), dismiss);
+    gtk_revealer_set_child(GTK_REVEALER(ctx->notice), ctx->notice_box);
+    return ctx->notice;
+}
+
+/* ---- persistence ---- */
+
+static void load_on_startup(AppCtx *ctx)
+{
+    ArmsStatus st = persist_load(ctx->save_path, &ctx->sys);
+    if (st == ARMS_OK || st == ARMS_ERR_NOT_FOUND)   /* NOT_FOUND = first run */
+        return;
+
+    char msg[400];
+    ctx->load_failed = 1;
+    snprintf(msg, sizeof msg, "Could not load %s (%s). Saving is disabled so the file is kept.",
+             ctx->save_path, arms_status_str(st));
+    app_show_notice(ctx, 1, msg);
+}
+
+/* Returns 1 if the save succeeded; on failure or a blocked save a notice explains why. */
+static int save_now(AppCtx *ctx, int announce_success)
+{
+    char msg[400];
+
+    if (ctx->load_failed) {
+        app_show_notice(ctx, 1, "Saving is disabled: the existing save could not be loaded.");
+        return 0;
+    }
+    ArmsStatus st = persist_save(ctx->save_path, &ctx->sys);
+    if (st != ARMS_OK) {
+        snprintf(msg, sizeof msg, "Save failed (%s).", arms_status_str(st));
+        app_show_notice(ctx, 1, msg);
+        return 0;
+    }
+    if (announce_success) {
+        snprintf(msg, sizeof msg, "Saved to %s.", ctx->save_path);
+        app_show_notice(ctx, 0, msg);
+    }
+    return 1;
+}
+
+static void on_save_clicked(GtkButton *button, gpointer user_data)
+{
+    (void)button;
+    save_now(user_data, 1);
+}
+
+/* Returning TRUE cancels the close. A blocked save (load_failed) must not trap the user. */
+static gboolean on_close_request(GtkWindow *window, gpointer user_data)
+{
+    (void)window;
+    AppCtx *ctx = user_data;
+    if (ctx->load_failed)
+        return FALSE;
+    return !save_now(ctx, 0);
+}
+
+/* ---- navigation ---- */
+
+static void on_row_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_data)
+{
+    (void)box;
+    AppCtx *ctx = user_data;
+    if (row == NULL)
+        return;
+
+    int page = gtk_list_box_row_get_index(row);
+    gtk_stack_set_visible_child_name(GTK_STACK(ctx->stack), PAGE_TITLE[page]);
+    if (page == PAGE_DASHBOARD)
+        page_dashboard_refresh(ctx);
+}
+
+static GtkWidget *build_pages(AppCtx *ctx)
+{
+    ctx->stack = gtk_stack_new();
+    gtk_widget_set_hexpand(ctx->stack, TRUE);
+    gtk_widget_set_vexpand(ctx->stack, TRUE);
+
+    for (int i = 0; i < PAGE_COUNT; i++) {
+        GtkWidget *page = (i == PAGE_DASHBOARD)
+            ? page_dashboard_new(ctx)
+            : page_placeholder_new(PAGE_TITLE[i], PAGE_NOTE[i]);
+        gtk_stack_add_named(GTK_STACK(ctx->stack), page, PAGE_TITLE[i]);
+    }
+    return ctx->stack;
+}
+
+static GtkWidget *build_sidebar(AppCtx *ctx)
+{
+    ctx->sidebar = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(ctx->sidebar), GTK_SELECTION_SINGLE);
+    gtk_widget_add_css_class(ctx->sidebar, "sidebar");
+    gtk_widget_set_size_request(ctx->sidebar, 200, -1);
+
+    for (int i = 0; i < PAGE_COUNT; i++) {
+        GtkWidget *label = gtk_label_new(PAGE_TITLE[i]);
+        gtk_widget_set_halign(label, GTK_ALIGN_START);
+        gtk_widget_add_css_class(label, "sidebar-item");
+        gtk_list_box_append(GTK_LIST_BOX(ctx->sidebar), label);
+    }
+    g_signal_connect(ctx->sidebar, "row-selected", G_CALLBACK(on_row_selected), ctx);
+    return ctx->sidebar;
+}
+
+/* ---- styling ---- */
+
+static void load_css(void)
+{
+    if (!g_file_test(CSS_PATH, G_FILE_TEST_EXISTS)) {
+        g_warning("%s not found; using default styling", CSS_PATH);
+        return;
+    }
+    GtkCssProvider *provider = gtk_css_provider_new();
+    GFile *file = g_file_new_for_path(CSS_PATH);
+    gtk_css_provider_load_from_file(provider, file);
+    gtk_style_context_add_provider_for_display(gdk_display_get_default(),
+                                               GTK_STYLE_PROVIDER(provider),
+                                               GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(file);
+    g_object_unref(provider);
+}
+
+/* ---- window ---- */
+
+void app_activate(GtkApplication *app, gpointer user_data)
+{
+    AppCtx *ctx = user_data;
+
+    ctx->window = GTK_WINDOW(gtk_application_window_new(app));
+    gtk_window_set_title(ctx->window, "ARMS - Airport Runway Management System");
+    gtk_window_set_default_size(ctx->window, 1100, 700);
+    load_css();
+
+    GtkWidget *header = gtk_header_bar_new();
+    GtkWidget *save = gtk_button_new_with_label("Save");
+    g_signal_connect(save, "clicked", G_CALLBACK(on_save_clicked), ctx);
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(header), save);
+    gtk_window_set_titlebar(ctx->window, header);
+
+    GtkWidget *body = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_box_append(GTK_BOX(body), build_sidebar(ctx));
+    gtk_box_append(GTK_BOX(body), gtk_separator_new(GTK_ORIENTATION_VERTICAL));
+    gtk_box_append(GTK_BOX(body), build_pages(ctx));
+
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_append(GTK_BOX(root), notice_new(ctx));
+    gtk_box_append(GTK_BOX(root), body);
+    gtk_window_set_child(ctx->window, root);
+
+    load_on_startup(ctx);
+    page_dashboard_refresh(ctx);
+
+    g_signal_connect(ctx->window, "close-request", G_CALLBACK(on_close_request), ctx);
+    gtk_list_box_select_row(GTK_LIST_BOX(ctx->sidebar),
+                            gtk_list_box_get_row_at_index(GTK_LIST_BOX(ctx->sidebar), PAGE_DASHBOARD));
+    gtk_window_present(ctx->window);
+}
