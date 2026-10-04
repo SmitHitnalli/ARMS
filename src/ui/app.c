@@ -2,11 +2,33 @@
 #include "page_dashboard.h"
 #include "page_flights.h"
 #include "page_runways.h"
+#include "page_scheduler.h"
+#include "page_holding.h"
 #include "page_placeholder.h"
 #include "persist.h"
 
+/* Runtime files, relative to the project root (the executable is <root>/build/arms.exe). */
 #define SAVE_PATH "data/arms.dat"
 #define CSS_PATH  "assets/css/arms.css"
+
+/* <exe dir>/../<rel>, normalised, independent of the working directory.
+ * Returns a newly allocated path (g_free), or NULL if the executable location is unknown. */
+static char *project_path(const char *rel)
+{
+    char *result = NULL;
+#ifdef G_OS_WIN32
+    gchar *exe_dir = g_win32_get_package_installation_directory_of_module(NULL);
+    if (exe_dir != NULL) {
+        char *raw = g_build_filename(exe_dir, "..", rel, NULL);
+        result = g_canonicalize_filename(raw, NULL);
+        g_free(raw);
+        g_free(exe_dir);
+    }
+#else
+    (void)rel;
+#endif
+    return result;
+}
 
 static const char *PAGE_TITLE[PAGE_COUNT] = {
     "Dashboard", "Flights", "Runways", "Scheduler", "Holding",
@@ -24,7 +46,13 @@ void app_ctx_init(AppCtx *ctx, GtkApplication *app)
     memset(ctx, 0, sizeof *ctx);
     arms_system_init(&ctx->sys);
     ctx->app = app;
-    snprintf(ctx->save_path, sizeof ctx->save_path, "%s", SAVE_PATH);
+
+    /* An empty save_path means "could not be resolved": load_on_startup then blocks saving.
+     * There is deliberately no CWD-relative fallback, which could touch the wrong save. */
+    char *path = project_path(SAVE_PATH);
+    if (path != NULL && strlen(path) < sizeof ctx->save_path)
+        snprintf(ctx->save_path, sizeof ctx->save_path, "%s", path);
+    g_free(path);
 }
 
 void app_ctx_free(AppCtx *ctx)
@@ -74,6 +102,12 @@ static GtkWidget *notice_new(AppCtx *ctx)
 
 static void load_on_startup(AppCtx *ctx)
 {
+    if (ctx->save_path[0] == '\0') {
+        ctx->load_failed = 1;
+        app_show_notice(ctx, 1, "Could not locate the data folder next to the executable. "
+                                "Saving is disabled.");
+        return;
+    }
     ArmsStatus st = persist_load(ctx->save_path, &ctx->sys);
     if (st == ARMS_OK || st == ARMS_ERR_NOT_FOUND)   /* NOT_FOUND = first run */
         return;
@@ -123,6 +157,17 @@ static gboolean on_close_request(GtkWindow *window, gpointer user_data)
     return !save_now(ctx, 0);
 }
 
+/* ---- refresh ---- */
+
+void app_refresh_all(AppCtx *ctx)
+{
+    page_dashboard_refresh(ctx);
+    page_flights_refresh(ctx);
+    page_runways_refresh(ctx);
+    page_scheduler_refresh(ctx);
+    page_holding_refresh(ctx);
+}
+
 /* ---- navigation ---- */
 
 static void on_row_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_data)
@@ -134,12 +179,7 @@ static void on_row_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_d
 
     int page = gtk_list_box_row_get_index(row);
     gtk_stack_set_visible_child_name(GTK_STACK(ctx->stack), PAGE_TITLE[page]);
-    if (page == PAGE_DASHBOARD)
-        page_dashboard_refresh(ctx);
-    else if (page == PAGE_FLIGHTS)
-        page_flights_refresh(ctx);
-    else if (page == PAGE_RUNWAYS)
-        page_runways_refresh(ctx);
+    app_refresh_all(ctx);
 }
 
 static GtkWidget *build_pages(AppCtx *ctx)
@@ -156,6 +196,10 @@ static GtkWidget *build_pages(AppCtx *ctx)
             page = page_flights_new(ctx);
         else if (i == PAGE_RUNWAYS)
             page = page_runways_new(ctx);
+        else if (i == PAGE_SCHEDULER)
+            page = page_scheduler_new(ctx);
+        else if (i == PAGE_HOLDING)
+            page = page_holding_new(ctx);
         else
             page = page_placeholder_new(PAGE_TITLE[i], PAGE_NOTE[i]);
         gtk_stack_add_named(GTK_STACK(ctx->stack), page, PAGE_TITLE[i]);
@@ -182,20 +226,32 @@ static GtkWidget *build_sidebar(AppCtx *ctx)
 
 /* ---- styling ---- */
 
+/* Executable-relative first; the repo-root-relative path is only a convenience for CSS. */
+static char *find_css(void)
+{
+    char *path = project_path(CSS_PATH);
+    if (path != NULL && g_file_test(path, G_FILE_TEST_EXISTS))
+        return path;
+    g_free(path);
+    return g_file_test(CSS_PATH, G_FILE_TEST_EXISTS) ? g_strdup(CSS_PATH) : NULL;
+}
+
 static void load_css(void)
 {
-    if (!g_file_test(CSS_PATH, G_FILE_TEST_EXISTS)) {
+    char *path = find_css();
+    if (path == NULL) {
         g_warning("%s not found; using default styling", CSS_PATH);
         return;
     }
     GtkCssProvider *provider = gtk_css_provider_new();
-    GFile *file = g_file_new_for_path(CSS_PATH);
+    GFile *file = g_file_new_for_path(path);
     gtk_css_provider_load_from_file(provider, file);
     gtk_style_context_add_provider_for_display(gdk_display_get_default(),
                                                GTK_STYLE_PROVIDER(provider),
                                                GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(file);
     g_object_unref(provider);
+    g_free(path);
 }
 
 /* ---- window ---- */
@@ -226,9 +282,7 @@ void app_activate(GtkApplication *app, gpointer user_data)
     gtk_window_set_child(ctx->window, root);
 
     load_on_startup(ctx);
-    page_dashboard_refresh(ctx);
-    page_flights_refresh(ctx);
-    page_runways_refresh(ctx);
+    app_refresh_all(ctx);
 
     g_signal_connect(ctx->window, "close-request", G_CALLBACK(on_close_request), ctx);
     gtk_list_box_select_row(GTK_LIST_BOX(ctx->sidebar),

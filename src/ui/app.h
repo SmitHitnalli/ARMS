@@ -42,6 +42,26 @@ typedef struct {
     GtkWidget *category_dd;
 } RunwaysWidgets;
 
+/* Scheduler page: dropdowns and the tables that are rebuilt on refresh. */
+typedef struct {
+    GtkWidget *submit_dd;      /* REGISTERED flights */
+    GtkWidget *prio_dd;        /* flights whose emergency/fuel can still change */
+    GtkWidget *emergency_dd;
+    GtkWidget *fuel_dd;
+    GtkWidget *landing_grid;
+    GtkWidget *takeoff_grid;
+    GtkWidget *heap_grid;      /* priority-order preview */
+    GtkWidget *raw_grid;       /* developer: raw heap array */
+    GtkWidget *ops_grid;       /* Start / Complete / Cancel */
+} SchedulerWidgets;
+
+/* Holding page: the holding table, the Enter dropdown and the developer text. */
+typedef struct {
+    GtkWidget *grid;
+    GtkWidget *enter_dd;       /* WAITING flights */
+    GtkWidget *dev_label;
+} HoldingWidgets;
+
 /* The whole application state. Lives on main()'s stack; no UI globals. */
 typedef struct {
     ArmsSystem       sys;
@@ -55,6 +75,8 @@ typedef struct {
     DashboardWidgets dashboard;
     FlightsWidgets   flights_page;
     RunwaysWidgets   runways_page;
+    SchedulerWidgets scheduler_page;
+    HoldingWidgets   holding_page;
     char             save_path[260];
     int              load_failed;   /* 1 = a save exists but could not be loaded: never overwrite it */
 } AppCtx;
@@ -70,5 +92,8 @@ void app_activate(GtkApplication *app, gpointer user_data);
 
 /* Shows a dismissible message under the header (is_error selects the colour). */
 void app_show_notice(AppCtx *ctx, int is_error, const char *message);
+
+/* Refreshes the Dashboard, Flights, Runways, Scheduler and Holding pages. */
+void app_refresh_all(AppCtx *ctx);
 
 #endif
