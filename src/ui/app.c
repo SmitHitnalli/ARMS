@@ -4,6 +4,9 @@
 #include "page_runways.h"
 #include "page_scheduler.h"
 #include "page_holding.h"
+#include "page_history.h"
+#include "page_graph.h"
+#include "page_reports.h"
 #include "page_placeholder.h"
 #include "persist.h"
 
@@ -36,9 +39,8 @@ static const char *PAGE_TITLE[PAGE_COUNT] = {
 };
 
 static const char *PAGE_NOTE[PAGE_COUNT] = {
-    "", "Coming in a later phase", "Coming in a later phase", "Coming in a later phase",
-    "Coming in a later phase", "Coming in a later phase", "Coming in a later phase",
-    "Coming in a later phase", "Needs the event-log module, which does not exist yet"
+    "", "", "", "", "", "", "", "",
+    "Needs the event-log module, which does not exist yet"
 };
 
 void app_ctx_init(AppCtx *ctx, GtkApplication *app)
@@ -166,6 +168,9 @@ void app_refresh_all(AppCtx *ctx)
     page_runways_refresh(ctx);
     page_scheduler_refresh(ctx);
     page_holding_refresh(ctx);
+    page_history_refresh(ctx);
+    page_graph_refresh(ctx);
+    page_reports_refresh(ctx);
 }
 
 /* ---- navigation ---- */
@@ -200,6 +205,12 @@ static GtkWidget *build_pages(AppCtx *ctx)
             page = page_scheduler_new(ctx);
         else if (i == PAGE_HOLDING)
             page = page_holding_new(ctx);
+        else if (i == PAGE_HISTORY)
+            page = page_history_new(ctx);
+        else if (i == PAGE_GRAPH)
+            page = page_graph_new(ctx);
+        else if (i == PAGE_REPORTS)
+            page = page_reports_new(ctx);
         else
             page = page_placeholder_new(PAGE_TITLE[i], PAGE_NOTE[i]);
         gtk_stack_add_named(GTK_STACK(ctx->stack), page, PAGE_TITLE[i]);

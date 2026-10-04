@@ -62,6 +62,39 @@ typedef struct {
     GtkWidget *dev_label;
 } HoldingWidgets;
 
+/* Movement History page: the table and the record count. */
+typedef struct {
+    GtkWidget *grid;
+    GtkWidget *count_label;
+} HistoryWidgets;
+
+/* Airport Graph page: forms, node dropdowns, result labels and the developer matrix. */
+typedef struct {
+    GtkWidget *id_entry;
+    GtkWidget *label_entry;
+    GtkWidget *edge_a_dd;
+    GtkWidget *edge_b_dd;
+    GtkWidget *nodes_grid;
+    GtkWidget *trav_dd;
+    GtkWidget *trav_label;
+    GtkWidget *reach_from_dd;
+    GtkWidget *reach_to_dd;
+    GtkWidget *reach_label;
+    GtkWidget *matrix_label;
+} GraphWidgets;
+
+/* Reports page: sort selectors, the two report tables and the binary-search control. */
+typedef struct {
+    GtkWidget *flight_key_dd;
+    GtkWidget *flight_order_dd;
+    GtkWidget *flight_grid;
+    GtkWidget *hist_key_dd;
+    GtkWidget *hist_order_dd;
+    GtkWidget *hist_grid;
+    GtkWidget *find_entry;
+    GtkWidget *find_label;
+} ReportsWidgets;
+
 /* The whole application state. Lives on main()'s stack; no UI globals. */
 typedef struct {
     ArmsSystem       sys;
@@ -77,6 +110,9 @@ typedef struct {
     RunwaysWidgets   runways_page;
     SchedulerWidgets scheduler_page;
     HoldingWidgets   holding_page;
+    HistoryWidgets   history_page;
+    GraphWidgets     graph_page;
+    ReportsWidgets   reports_page;
     char             save_path[260];
     int              load_failed;   /* 1 = a save exists but could not be loaded: never overwrite it */
 } AppCtx;
@@ -93,7 +129,7 @@ void app_activate(GtkApplication *app, gpointer user_data);
 /* Shows a dismissible message under the header (is_error selects the colour). */
 void app_show_notice(AppCtx *ctx, int is_error, const char *message);
 
-/* Refreshes the Dashboard, Flights, Runways, Scheduler and Holding pages. */
+/* Refreshes every page except the Event Log placeholder. */
 void app_refresh_all(AppCtx *ctx);
 
 #endif
