@@ -1,5 +1,8 @@
 # ARMS — Airport Runway Management System
 
+## Notion File
+https://app.notion.com/p/ARMS-Airport-Runway-Management-System-3ee86f0db4b9806fac50fb6d483adc63?source=copy_link
+
 ## Project Overview
 
 ARMS is a desktop application that manages flights and runways at an airport: it registers flights, queues landing and takeoff requests, ranks them by urgency, assigns them to compatible runways, and keeps a history and audit trail of what happened.
